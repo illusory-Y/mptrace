@@ -1,7 +1,7 @@
 // 全局设置：首次引导状态、保存目录、主题、字体大小、信令地址；localStorage 持久化
 import { defineStore } from 'pinia'
 import { isTauri } from '../services/tauri'
-import type { EnvInfo, PickedDir } from '../types'
+import type { DeviceInfo, EnvInfo, PickedDir, RecentPeer } from '../types'
 
 const STORAGE_KEY = 'lts-settings-v1'
 
@@ -20,6 +20,30 @@ interface AppState {
   saveDirDisplay: string
   signalUrl: string
   stunUrl: string
+  /** 本机持久设备身份（用于一键重连） */
+  deviceId: string
+  deviceName: string
+  deviceKind: 'computer' | 'phone'
+  /** 最近连接的设备（最多 5 个） */
+  recentPeers: RecentPeer[]
+}
+
+function detectDeviceKind(): 'computer' | 'phone' {
+  if (typeof navigator !== 'undefined' && /android|iphone|ipad|mobile/i.test(navigator.userAgent)) {
+    return 'phone'
+  }
+  return 'computer'
+}
+
+function genDeviceId(): string {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID()
+    }
+  } catch {
+    /* ignore */
+  }
+  return 'd-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
 }
 
 function loadPersisted(): Partial<AppState> {
@@ -45,6 +69,10 @@ function defaultSignalUrl(): string {
 export const useAppStore = defineStore('app', {
   state: (): AppState => {
     const persisted = loadPersisted()
+    const kind =
+      persisted.deviceKind === 'phone' || persisted.deviceKind === 'computer'
+        ? persisted.deviceKind
+        : detectDeviceKind()
     return {
       onboarded: false,
       theme: 'light',
@@ -61,6 +89,11 @@ export const useAppStore = defineStore('app', {
         persisted.stunUrl ||
         import.meta.env.VITE_STUN_URL ||
         'stun:stun.l.google.com:19302',
+      // 设备身份
+      deviceId: persisted.deviceId || genDeviceId(),
+      deviceKind: kind,
+      deviceName: persisted.deviceName || (kind === 'phone' ? '我的手机' : '我的电脑'),
+      recentPeers: Array.isArray(persisted.recentPeers) ? persisted.recentPeers : [],
     }
   },
   getters: {
@@ -85,6 +118,10 @@ export const useAppStore = defineStore('app', {
         saveDirDisplay: this.saveDirDisplay,
         signalUrl: this.signalUrl,
         stunUrl: this.stunUrl,
+        deviceId: this.deviceId,
+        deviceName: this.deviceName,
+        deviceKind: this.deviceKind,
+        recentPeers: this.recentPeers,
       }
       localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
     },
@@ -135,6 +172,33 @@ export const useAppStore = defineStore('app', {
     },
     setSignalUrl(url: string) {
       this.signalUrl = url.trim()
+      this.persist()
+    },
+    setDeviceName(name: string) {
+      this.deviceName = name.trim() || (this.deviceKind === 'phone' ? '我的手机' : '我的电脑')
+      this.persist()
+    },
+    /** 配对成功后记住对方设备（去重、最多 5 个、按时间倒序） */
+    addRecentPeer(info: DeviceInfo) {
+      if (!info.deviceId) return
+      const kind =
+        info.kind === 'computer' || info.kind === 'phone' ? info.kind : 'unknown'
+      const others = this.recentPeers.filter((p) => p.deviceId !== info.deviceId)
+      const entry: RecentPeer = {
+        deviceId: info.deviceId,
+        name: info.name || '未命名设备',
+        kind,
+        lastConnectedAt: Date.now(),
+      }
+      this.recentPeers = [entry, ...others].slice(0, 5)
+      this.persist()
+    },
+    removeRecentPeer(deviceId: string) {
+      this.recentPeers = this.recentPeers.filter((p) => p.deviceId !== deviceId)
+      this.persist()
+    },
+    clearRecentPeers() {
+      this.recentPeers = []
       this.persist()
     },
   },

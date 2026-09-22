@@ -18,7 +18,10 @@ export class SignalingClient {
     return this.ws?.readyState === WebSocket.OPEN
   }
 
-  connect(url: string): Promise<void> {
+  connect(
+    url: string,
+    hello?: { deviceId?: string; name?: string; kind?: string },
+  ): Promise<void> {
     this.url = url
     return new Promise((resolve, reject) => {
       let settled = false
@@ -26,7 +29,7 @@ export class SignalingClient {
       this.ws = ws
       ws.onopen = () => {
         settled = true
-        this.send({ type: 'hello' })
+        this.send({ type: 'hello', ...(hello || {}) })
         while (this.queue.length) this.rawSend(this.queue.shift()!)
         this.statusHandlers.forEach((fn) => fn('open'))
         resolve()

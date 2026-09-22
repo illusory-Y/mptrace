@@ -8,6 +8,7 @@
 import type { SignalingClient } from './signaling'
 import type {
   ChannelControl,
+  DeviceInfo,
   NetPathKind,
   PeerPhase,
   SignalMessage,
@@ -28,6 +29,10 @@ export interface PeerCallbacks {
   onNetPath: (kind: NetPathKind) => void
   onIncomingRequest: () => void
   onReceivedImage: (blob: Blob, savedDisplay: string) => void
+  /** 收到某设备的一键重连呼叫，等待用户在 UI 接受 / 拒绝 */
+  onIncomingCall: (from: DeviceInfo, callId: string) => void
+  /** 配对成功，记住对方设备（写入最近连接） */
+  onRememberDevice: (peer: DeviceInfo) => void
   /** 返回当前用户配置的保存目录（保证设置更改后实时生效） */
   getSaveDir: () => string
 }
@@ -97,6 +102,12 @@ export class TransferPeer {
   /** 接收端用户在弹窗中点"接受" */
   async accept() {
     if (!this.pc || this.role !== 'receiver') return
+    await this.beginOffer()
+  }
+
+  /** WebRTC host：建数据通道并发送 offer（配对码接受 / 设备呼叫接通后复用） */
+  private async beginOffer() {
+    if (!this.pc) return
     this.cb.onPhase('connecting')
     const ch = this.pc.createDataChannel('files', { ordered: true })
     this.bindChannel(ch)
@@ -109,6 +120,34 @@ export class TransferPeer {
   reject() {
     this.signaling.send({ type: 'leave' })
     this.cb.onPhase('closed', '已拒绝连接请求')
+    this.teardown()
+  }
+
+  /** 一键重连：呼叫最近设备（本端为 WebRTC guest，等 offer 回 answer） */
+  async startCall(targetDeviceId: string, iceServers: RTCIceServer[]) {
+    this.reset()
+    this.role = 'sender'
+    this.iceServers = iceServers
+    this.createPc()
+    this.pc!.ondatachannel = (ev) => this.bindChannel(ev.channel)
+    this.cb.onPhase('joining')
+    this.signaling.send({ type: 'call', target: targetDeviceId })
+  }
+
+  /** 被呼叫方接受重连（本端为 WebRTC host，服务端接通后在 call-accepted 里发 offer） */
+  async acceptCall(callId: string, iceServers: RTCIceServer[]) {
+    this.reset()
+    this.role = 'receiver'
+    this.iceServers = iceServers
+    this.createPc()
+    this.cb.onPhase('connecting')
+    this.signaling.send({ type: 'call-accept', callId })
+  }
+
+  /** 被呼叫方拒绝重连 */
+  rejectCall(callId: string) {
+    this.signaling.send({ type: 'call-reject', callId })
+    this.cb.onPhase('idle')
     this.teardown()
   }
 
@@ -132,11 +171,27 @@ export class TransferPeer {
         this.cb.onPhase('waiting')
         break
       case 'joined':
+        if (msg.peer) this.cb.onRememberDevice(msg.peer)
         this.cb.onPhase('connecting')
         break
       case 'peer-join':
+        if (msg.peer) this.cb.onRememberDevice(msg.peer)
         this.cb.onPhase('incoming-request')
         this.cb.onIncomingRequest()
+        break
+      // ---- 一键重连 ----
+      case 'incoming-call':
+        this.cb.onIncomingCall(msg.from, msg.callId)
+        break
+      case 'call-connected':
+        this.cb.onPhase('connecting')
+        break
+      case 'call-accepted':
+        void this.beginOffer()
+        break
+      case 'call-rejected':
+        this.cb.onPhase('error', '对方拒绝了重连请求')
+        this.teardown()
         break
       case 'offer':
         void this.handleOffer(msg.sdp)

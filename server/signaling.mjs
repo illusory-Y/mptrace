@@ -45,9 +45,19 @@ const ICE_SERVERS = buildIceServers()
 
 /** @type {Map<string, {code:string, hostId:string, guestId:string|null, createdAt:number, timer:NodeJS.Timeout}>} */
 const rooms = new Map()
-/** @type {Map<string, {ws:WebSocket, roomCode:string|null, role:'host'|'guest'|null, ip:string}>} */
+/** @type {Map<string, {ws:WebSocket, roomCode:string|null, role:'host'|'guest'|null, ip:string, deviceId:string, name:string, kind:string, pendingCall:string|null}>} */
 const peers = new Map()
+/** 在线设备：deviceId -> peerId（用于一键重连） */
+const devices = new Map()
+/** 待接呼叫：callId -> {callerId:string, calleeId:string, timer:NodeJS.Timeout} */
+const pendingCalls = new Map()
 let idSeq = 1
+
+function deviceInfo(peerId) {
+  const p = peers.get(peerId)
+  if (!p || !p.deviceId) return null
+  return { deviceId: p.deviceId, name: p.name || '未命名设备', kind: p.kind || 'unknown' }
+}
 
 function genCode() {
   for (let i = 0; i < 50; i++) {
@@ -191,7 +201,16 @@ wss.on('connection', (ws, req) => {
   const ip = TRUST_PROXY
     ? (req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress || '')
     : req.socket.remoteAddress || ''
-  peers.set(peerId, { ws, roomCode: null, role: null, ip })
+  peers.set(peerId, {
+    ws,
+    roomCode: null,
+    role: null,
+    ip,
+    deviceId: '',
+    name: '',
+    kind: 'unknown',
+    pendingCall: null,
+  })
   console.log(`[peer ${peerId}] connected from ${ip}`)
 
   ws.isAlive = true
@@ -211,6 +230,11 @@ wss.on('connection', (ws, req) => {
 
     switch (msg.type) {
       case 'hello': {
+        // 注册持久设备身份（用于一键重连）
+        peer.deviceId = String(msg.deviceId || '')
+        peer.name = String(msg.name || '未知设备')
+        peer.kind = String(msg.kind || 'unknown')
+        if (peer.deviceId) devices.set(peer.deviceId, peerId)
         // 下发 ICE 配置（含私有 TURN 凭据）与配对码有效期
         send(ws, { type: 'config', iceServers: ICE_SERVERS, ttlMs: CODE_TTL_MS })
         break
@@ -260,8 +284,8 @@ wss.on('connection', (ws, req) => {
         room.guestId = peerId
         peer.roomCode = code
         peer.role = 'guest'
-        send(ws, { type: 'joined' })
-        sendTo(room.hostId, { type: 'peer-join', peerId })
+        send(ws, { type: 'joined', peer: deviceInfo(room.hostId) || undefined })
+        sendTo(room.hostId, { type: 'peer-join', peerId, peer: deviceInfo(peerId) || undefined })
         console.log(`[room ${code}] guest ${peerId} joined`)
         break
       }
@@ -285,12 +309,130 @@ wss.on('connection', (ws, req) => {
         break
       }
 
+      // ---- 设备到设备一键重连 ----
+      case 'call': {
+        const targetDevice = String(msg.target || '')
+        const calleeId = devices.get(targetDevice)
+        if (!calleeId) {
+          return send(ws, {
+            type: 'error',
+            message: '对方当前不在线，无法自动重连（请改用扫码或配对码）',
+          })
+        }
+        if (calleeId === peerId) {
+          return send(ws, { type: 'error', message: '不能呼叫自己' })
+        }
+        // 清理本连接之前未完成的呼叫
+        for (const [id, c] of pendingCalls) {
+          if (c.callerId === peerId || c.calleeId === peerId) {
+            clearTimeout(c.timer)
+            pendingCalls.delete(id)
+            const other = c.callerId === peerId ? c.calleeId : c.callerId
+            const op = peers.get(other)
+            if (op) op.pendingCall = null
+          }
+        }
+        const callId = 'c' + randomInt(1e8, 1e10).toString(36)
+        const timer = setTimeout(() => {
+          if (!pendingCalls.has(callId)) return
+          pendingCalls.delete(callId)
+          const op = peers.get(calleeId)
+          if (op) op.pendingCall = null
+          peer.pendingCall = null
+          sendTo(peerId, { type: 'error', message: '对方暂无应答，请稍后再试或改用扫码' })
+        }, 60_000)
+        pendingCalls.set(callId, { callerId: peerId, calleeId, timer })
+        peer.pendingCall = callId
+        const callee = peers.get(calleeId)
+        if (callee) callee.pendingCall = callId
+        const from =
+          deviceInfo(peerId) || {
+            deviceId: '',
+            name: peer.name || '未知设备',
+            kind: peer.kind || 'unknown',
+          }
+        sendTo(calleeId, { type: 'incoming-call', callId, from })
+        console.log(`[call ${callId}] ${peerId} -> ${calleeId}`)
+        break
+      }
+
+      case 'call-accept': {
+        const callId = String(msg.callId || '')
+        const c = pendingCalls.get(callId)
+        if (!c) return send(ws, { type: 'error', message: '呼叫已失效，请重新发起' })
+        if (c.calleeId !== peerId) return
+        clearTimeout(c.timer)
+        // 双方先静默退出旧房间
+        leaveRoom(c.callerId, false)
+        leaveRoom(c.calleeId, false)
+        const roomTimer = setTimeout(() => {
+          if (!rooms.has(callId)) return
+          rooms.delete(callId)
+          sendTo(c.callerId, { type: 'expired' })
+          sendTo(c.calleeId, { type: 'expired' })
+        }, CODE_TTL_MS)
+        // 正式房间：host=callee（建数据通道/发 offer），guest=caller（回 answer）
+        rooms.set(callId, {
+          code: callId,
+          hostId: c.calleeId,
+          guestId: c.callerId,
+          createdAt: Date.now(),
+          timer: roomTimer,
+        })
+        const calleeP = peers.get(c.calleeId)
+        calleeP.roomCode = callId
+        calleeP.role = 'host'
+        calleeP.pendingCall = null
+        const callerP = peers.get(c.callerId)
+        callerP.roomCode = callId
+        callerP.role = 'guest'
+        callerP.pendingCall = null
+        pendingCalls.delete(callId)
+        sendTo(c.callerId, { type: 'call-connected', callId })
+        send(ws, { type: 'call-accepted', callId })
+        console.log(`[call ${callId}] accepted; host=${c.calleeId} guest=${c.callerId}`)
+        break
+      }
+
+      case 'call-reject': {
+        const callId = String(msg.callId || '')
+        const c = pendingCalls.get(callId)
+        if (!c) break
+        clearTimeout(c.timer)
+        pendingCalls.delete(callId)
+        const cp = peers.get(c.callerId)
+        if (cp) cp.pendingCall = null
+        peer.pendingCall = null
+        sendTo(c.callerId, { type: 'call-rejected' })
+        break
+      }
+
       default:
         send(ws, { type: 'error', message: '未知消息类型' })
     }
   })
 
   ws.on('close', () => {
+    // 注销在线设备
+    if (peer.deviceId && devices.get(peer.deviceId) === peerId) {
+      devices.delete(peer.deviceId)
+    }
+    // 清理待接呼叫：作为被呼叫方离开则通知呼叫方，作为呼叫方离开则静默取消
+    if (peer.pendingCall) {
+      const c = pendingCalls.get(peer.pendingCall)
+      if (c) {
+        clearTimeout(c.timer)
+        pendingCalls.delete(peer.pendingCall)
+        if (c.calleeId === peerId) {
+          const callerP = peers.get(c.callerId)
+          if (callerP) callerP.pendingCall = null
+          sendTo(c.callerId, { type: 'call-rejected' })
+        } else {
+          const calleeP = peers.get(c.calleeId)
+          if (calleeP) calleeP.pendingCall = null
+        }
+      }
+    }
     leaveRoom(peerId, true)
     peers.delete(peerId)
     console.log(`[peer ${peerId}] closed`)

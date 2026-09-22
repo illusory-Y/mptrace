@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 全网通互传页：配对码/二维码 -> WebRTC 自动选路 -> 双向分块传输 -> 统一目录落盘
-import { nextTick, onBeforeUnmount, ref } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { BrowserMultiFormatReader, type IScannerControls } from '@zxing/browser'
 import { useAppStore } from '../stores/app'
 import { useOcrStore } from '../stores/ocr'
@@ -9,7 +9,7 @@ import { NET_PATH_LABEL, TransferPeer } from '../services/webrtc'
 import { setActivePeer } from '../services/peer-session'
 import { makePairQr, parsePairQr } from '../services/qr'
 import { formatBytes, formatSpeed } from '../services/files'
-import type { NetPathKind, PeerPhase, TransferJob } from '../types'
+import type { DeviceInfo, NetPathKind, PeerPhase, RecentPeer, TransferJob } from '../types'
 
 const app = useAppStore()
 const ocrStore = useOcrStore()
@@ -28,6 +28,8 @@ const codeInput = ref('')
 const toast = ref('')
 const dragOver = ref(false)
 const scanOpen = ref(false)
+const incomingCall = ref<{ from: DeviceInfo; callId: string } | null>(null)
+const showHotspot = ref(false)
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const cameraInput = ref<HTMLInputElement | null>(null)
@@ -42,6 +44,18 @@ let scanControls: IScannerControls | null = null
 let toastTimer: number | undefined
 
 onBeforeUnmount(() => fullReset())
+onMounted(() => void goOnline())
+
+/** 进入页面即连信令、注册设备（待命 peer），不选角色也能收到一键重连呼叫 */
+async function goOnline() {
+  try {
+    const client = await ensureSignal()
+    if (!peer) peer = registerPeer(client)
+  } catch (e) {
+    // 离线或未配置信令时静默，不打断页面
+    console.warn('[transfer] 自动上线跳过：', (e as Error).message)
+  }
+}
 
 function showToast(msg: string) {
   toast.value = msg
@@ -88,7 +102,11 @@ async function ensureSignal(): Promise<SignalingClient> {
       phaseDetail.value = detail || '信令连接断开'
     }
   })
-  await client.connect(app.signalUrl)
+  await client.connect(app.signalUrl, {
+    deviceId: app.deviceId,
+    name: app.deviceName,
+    kind: app.deviceKind,
+  })
   signaling = client
   signalState.value = 'open'
   return client
@@ -114,6 +132,10 @@ function makePeer(client: SignalingClient): TransferPeer {
       ocrStore.pushIncoming(blob, display || '接收的图片')
       showToast('图片接收完成，已自动载入「识别」页，可直接识别')
     },
+    onIncomingCall: (from, callId) => {
+      incomingCall.value = { from, callId }
+    },
+    onRememberDevice: (d) => app.addRecentPeer(d),
   })
 }
 
@@ -183,6 +205,45 @@ function acceptIncoming() {
 function rejectIncoming() {
   showIncoming.value = false
   peer?.reject()
+}
+
+/** 一键重连最近设备（复用待命 peer，startCall 内部会重置连接） */
+async function reconnect(rp: RecentPeer) {
+  try {
+    const client = await ensureSignal()
+    if (!peer) peer = registerPeer(client)
+    role.value = 'sender'
+    netKind.value = 'unknown'
+    await tick(120)
+    await peer.startCall(rp.deviceId, buildIce())
+  } catch (e) {
+    showToast((e as Error).message)
+    phase.value = 'error'
+  }
+}
+
+/** 接受设备重连呼叫（本端成为 WebRTC host） */
+async function acceptCallFrom() {
+  if (!incomingCall.value) return
+  const callId = incomingCall.value.callId
+  incomingCall.value = null
+  try {
+    const client = await ensureSignal()
+    if (!peer) peer = registerPeer(client)
+    role.value = 'receiver'
+    netKind.value = 'unknown'
+    await peer.acceptCall(callId, buildIce())
+  } catch (e) {
+    showToast((e as Error).message)
+  }
+}
+
+/** 拒绝设备重连呼叫 */
+function rejectCallFrom() {
+  if (!incomingCall.value) return
+  const callId = incomingCall.value.callId
+  peer?.rejectCall(callId)
+  incomingCall.value = null
 }
 
 function startCountdown(expiresAt: number) {
@@ -267,6 +328,7 @@ function softReset() {
   qrUrl.value = ''
   netKind.value = 'unknown'
   showIncoming.value = false
+  incomingCall.value = null
   if (countdownTimer) clearInterval(countdownTimer)
   remainSec.value = 0
 }
@@ -317,6 +379,24 @@ function onlyDigits(v: string) {
     <!-- 角色选择 -->
     <div class="card" v-if="!role">
       <h3>选择你的角色（无需登录、无需加好友）</h3>
+
+      <!-- 最近连接：一键重连 -->
+      <div v-if="app.recentPeers.length" class="recent">
+        <div class="recent-title">最近连接</div>
+        <button
+          v-for="rp in app.recentPeers"
+          :key="rp.deviceId"
+          class="recent-item"
+          @click="reconnect(rp)"
+        >
+          <span class="recent-badge" :class="rp.kind">{{
+            rp.kind === 'phone' ? '手机' : '电脑'
+          }}</span>
+          <span class="recent-name">{{ rp.name }}</span>
+          <span class="recent-go">重连 ›</span>
+        </button>
+      </div>
+
       <button class="btn btn-primary btn-lg btn-block" @click="quickScan">扫码连接</button>
       <p class="muted" style="text-align: center; margin: 10px 0">— 或手动选择角色、输入配对码 —</p>
       <div class="grid-2">
@@ -325,6 +405,9 @@ function onlyDigits(v: string) {
       </div>
       <p class="muted" style="margin: 10px 0 0">
         电脑端打开网页生成二维码，手机点「扫码连接」即可；摄像头不可用时，可手动选角色，输入对方屏幕上的 6 位配对码。
+      </p>
+      <p style="text-align: center; margin: 12px 0 0">
+        <button class="link-btn" @click="showHotspot = true">没有网络？开热点也能互传</button>
       </p>
     </div>
 
@@ -473,6 +556,47 @@ function onlyDigits(v: string) {
       </div>
     </div>
 
+    <!-- 一键重连来电弹窗 -->
+    <div v-if="incomingCall" class="modal-mask">
+      <div class="modal">
+        <h2>收到重连请求</h2>
+        <p>
+          <b>{{ incomingCall.from.name }}</b
+          >（{{ incomingCall.from.kind === 'phone' ? '手机' : '电脑' }}）想与你重新连接，是否接受？
+        </p>
+        <div class="grid-2" style="margin-top: 12px">
+          <button class="btn btn-danger btn-lg" @click="rejectCallFrom">拒绝</button>
+          <button class="btn btn-primary btn-lg" @click="acceptCallFrom">接受</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 开热点引导 -->
+    <div v-if="showHotspot" class="modal-mask" @click.self="showHotspot = false">
+      <div class="modal">
+        <h2>没有网络也能互传</h2>
+        <div class="hot-section">
+          <div class="hot-h">方式一：手机开个人热点（推荐）</div>
+          <ol class="hot-list">
+            <li>手机进入「设置 → 个人热点」，打开热点开关</li>
+            <li><b>无需插卡、不耗流量</b>，热点只用来建立本地连接</li>
+            <li>电脑连上该热点，再回到本页扫码 / 配对</li>
+          </ol>
+        </div>
+        <div class="hot-section">
+          <div class="hot-h">方式二：电脑开移动热点</div>
+          <ol class="hot-list">
+            <li>电脑「设置 → 网络和 Internet → 移动热点」，打开开关</li>
+            <li>手机连上该热点，再回到本页扫码 / 配对</li>
+          </ol>
+        </div>
+        <p class="muted hot-note">
+          原理：热点会组成一个没有互联网的局域网，文件在两台设备间直连传输，与能否上网无关；也可用 USB 数据线兜底。
+        </p>
+        <button class="btn btn-primary btn-lg btn-block" @click="showHotspot = false">我知道了</button>
+      </div>
+    </div>
+
     <!-- 扫码层 -->
     <div v-if="scanOpen" class="modal-mask" @click.self="closeScan">
       <div class="modal" style="max-width: 420px">
@@ -485,3 +609,92 @@ function onlyDigits(v: string) {
     <div v-if="toast" class="notice info" style="position: sticky; bottom: 12px">{{ toast }}</div>
   </section>
 </template>
+
+<style scoped>
+.recent {
+  margin: 2px 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.recent-title {
+  font-size: 0.8rem;
+  color: var(--text-sub);
+  padding: 8px 12px;
+  background: var(--bg-soft);
+}
+.recent-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  background: var(--bg-elev);
+  border: none;
+  border-top: 1px solid var(--border);
+  cursor: pointer;
+  text-align: left;
+  min-height: 48px;
+}
+.recent-item:active {
+  background: var(--bg-soft);
+}
+.recent-badge {
+  font-size: 0.72rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  color: var(--primary);
+  flex-shrink: 0;
+}
+.recent-badge.phone {
+  background: color-mix(in srgb, var(--success) 16%, transparent);
+  color: var(--success);
+}
+.recent-name {
+  flex: 1;
+  font-size: 0.95rem;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.recent-go {
+  font-size: 0.85rem;
+  color: var(--primary);
+  flex-shrink: 0;
+}
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--primary);
+  font-size: 0.88rem;
+  cursor: pointer;
+  min-height: 36px;
+  padding: 4px 10px;
+}
+.hot-section {
+  margin: 12px 0;
+}
+.hot-h {
+  font-weight: 600;
+  font-size: 0.95rem;
+  margin-bottom: 4px;
+  color: var(--text);
+}
+.hot-list {
+  margin: 0;
+  padding-left: 20px;
+}
+.hot-list li {
+  margin: 6px 0;
+  line-height: 1.5;
+  font-size: 0.9rem;
+  color: var(--text);
+}
+.hot-note {
+  font-size: 0.82rem;
+  line-height: 1.5;
+  margin: 10px 0;
+}
+</style>

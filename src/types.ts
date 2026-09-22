@@ -41,17 +41,37 @@ export interface IceConfig {
   ttlMs: number
 }
 
+/** 设备公开信息（用于记住设备 / 一键重连） */
+export interface DeviceInfo {
+  deviceId: string
+  name: string
+  kind: 'computer' | 'phone' | 'unknown'
+}
+
+/** 最近连接的设备（本地持久化） */
+export interface RecentPeer extends DeviceInfo {
+  lastConnectedAt: number
+}
+
 // ====== 信令协议（服务器只转发这些消息，永远不接触文件内容） ======
 
 export type SignalMessage =
-  | { type: 'hello' }
+  | { type: 'hello'; deviceId?: string; name?: string; kind?: string }
   | { type: 'leave' }
   | { type: 'config'; iceServers: RTCIceServer[]; ttlMs: number }
   | { type: 'create' }
   | { type: 'created'; code: string; expiresAt: number }
   | { type: 'join'; code: string }
-  | { type: 'joined' }
-  | { type: 'peer-join'; peerId: string }
+  | { type: 'joined'; peer?: DeviceInfo }
+  | { type: 'peer-join'; peerId: string; peer?: DeviceInfo }
+  // 设备到设备一键重连（基于持久 deviceId，服务端代为建房间）
+  | { type: 'call'; target: string }
+  | { type: 'incoming-call'; callId: string; from: DeviceInfo }
+  | { type: 'call-accept'; callId: string }
+  | { type: 'call-reject'; callId: string }
+  | { type: 'call-accepted'; callId: string }
+  | { type: 'call-connected'; callId: string }
+  | { type: 'call-rejected' }
   // offer/answer/candidate 服务端只在同一房间两端之间透传，不解析内容
   | { type: 'offer'; sdp: RTCSessionDescriptionInit }
   | { type: 'answer'; sdp: RTCSessionDescriptionInit }
