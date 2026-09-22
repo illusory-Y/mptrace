@@ -1,0 +1,10 @@
+services:
+  signaling:
+    build: .
+    container_name: lts-signaling
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      # 本机暴露；正式环境建议只绑 127.0.0.1，由 Caddy/Nginx 反代 wss
+      - "127.0.0.1:8787:8787"

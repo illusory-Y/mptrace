@@ -1,0 +1,33 @@
+<!--
+  需要合并进 `src-tauri/gen/android/app/src/main/AndroidManifest.xml` 的权限块
+  （执行 `npm run android:init` 后生成；把下面 uses-permission / uses-feature 复制到 <manifest> 内、<application> 之前）
+
+  权限最小化：
+  - 不申请 MANAGE_EXTERNAL_STORAGE（所有文件访问），Android 10+ 保存走 MediaStore/SAF
+  - 不申请通讯录、定位、麦克风等任何无关权限
+-->
+<uses-permission android:name="android.permission.INTERNET" />
+
+<!-- 拍照、扫描配对二维码 -->
+<uses-permission android:name="android.permission.CAMERA" />
+<uses-feature android:name="android.hardware.camera" android:required="false" />
+
+<!-- Android 13+ 读取相册图片 -->
+<uses-permission
+    android:name="android.permission.READ_MEDIA_IMAGES" />
+
+<!-- Android 12 及以下读取相册（33 以上不再需要） -->
+<uses-permission
+    android:name="android.permission.READ_EXTERNAL_STORAGE"
+    android:maxSdkVersion="32" />
+
+<!-- 仅 Android 9 及以下写公共 Download 需要；10+ 由 MediaStore/SAF 接管 -->
+<uses-permission
+    android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+    android:maxSdkVersion="28" />
+
+<!--
+  明文流量说明：
+  信令正式环境必须使用 wss://。若本地联调需要 ws:// 明文，
+  在 <application> 上加 android:usesCleartextTraffic="true"，正式包请改回 false。
+-->

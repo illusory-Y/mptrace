@@ -1,0 +1,16 @@
+{
+  "name": "lts-signaling",
+  "version": "1.0.0",
+  "private": true,
+  "description": "私传助手信令服务：仅转发配对与 WebRTC 协商，不接触文件内容",
+  "type": "module",
+  "main": "signaling.mjs",
+  "scripts": {
+    "start": "node signaling.mjs",
+    "dev": "node --watch signaling.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "ws": "^8.18.0"
+  }
+}

@@ -1,0 +1,24 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+.env
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# 运行时资源（体积大，由脚本拉取，不入库）
+public/wasm/*
+!public/wasm/.gitkeep
+public/models/*.onnx
+public/fonts/*.ttf
+public/fonts/*.otf
+public/fonts/*.ttc
+
+# 服务端
+server/node_modules/
+
+# 构建产物（APK / 签名附属文件，不入库）
+*.apk
+*.idsig

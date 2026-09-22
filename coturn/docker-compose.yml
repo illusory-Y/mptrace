@@ -1,0 +1,12 @@
+# Coturn 容器化部署：docker compose up -d
+# 注意使用 network_mode: host，TURN 中继需要直接使用宿主网络
+services:
+  coturn:
+    image: coturn/coturn:4.6
+    container_name: lts-coturn
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]

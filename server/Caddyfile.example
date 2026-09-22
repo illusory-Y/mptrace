@@ -1,0 +1,11 @@
+# Caddy 示例（自动申请并续期 HTTPS 证书，最省事）
+# 安装 caddy 后：caddy run --config Caddyfile
+# 前端信令地址填：wss://signal.example.com/ws
+
+signal.example.com {
+	@websocket path /ws
+	reverse_proxy @websocket 127.0.0.1:8787 {
+		header_up X-Forwarded-For {remote_host}
+	}
+	reverse_proxy /health 127.0.0.1:8787
+}
