@@ -5,10 +5,13 @@ services:
     name: mptrace
     runtime: node
     plan: free
-    buildCommand: npm install --no-audit --no-fund && npm run build:only
+    # --include=dev：构建期也安装 vite 等开发依赖（NODE_ENV=production 默认会跳过）
+    buildCommand: npm install --include=dev --no-audit --no-fund && npm run build:only
     startCommand: node server/signaling.mjs
     healthCheckPath: /health
     autoDeploy: true
     envVars:
       - key: NODE_ENV
         value: production
+      - key: NODE_VERSION
+        value: 20
