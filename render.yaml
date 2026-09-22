@@ -1,0 +1,14 @@
+# Render 部署蓝图（免费）：一个 Web Service 同端口托管网页 + 信令
+# 在 Render 选择 "New +" → "Blueprint"，连接本仓库即可自动创建，无需手填命令。
+services:
+  - type: web
+    name: mptrace
+    runtime: node
+    plan: free
+    buildCommand: npm install --no-audit --no-fund && npm run build:only
+    startCommand: node server/signaling.mjs
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production

@@ -24,11 +24,13 @@
     "@zxing/browser": "^0.1.5",
     "@zxing/library": "^0.21.3",
     "docx": "^9.0.2",
+    "dotenv": "^16.4.7",
     "onnxruntime-web": "^1.20.1",
     "pdf-lib": "^1.17.1",
     "pinia": "^2.2.6",
     "qrcode": "^1.5.4",
-    "vue": "^3.5.13"
+    "vue": "^3.5.13",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.1.0",
