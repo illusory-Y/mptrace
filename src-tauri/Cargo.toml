@@ -1,6 +1,6 @@
 [package]
 name = "local-transfer-suite"
-version = "1.0.0"
+version = "1.0.1"
 description = "本地 OCR + 点对点文件互传（个人/小范围私下使用）"
 authors = ["you"]
 edition = "2021"

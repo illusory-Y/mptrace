@@ -12,6 +12,7 @@ export async function fetchEnvInfo(): Promise<EnvInfo> {
       os: 'web',
       defaultDir: '<browser-downloads>',
       defaultDisplay: '浏览器默认下载目录（网页调试模式，安装版会使用真实目录）',
+      statusBarHeight: 0,
     }
   }
   return invoke<EnvInfo>('env_info')

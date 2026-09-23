@@ -77,7 +77,9 @@ body {
 
 .app-header {
   padding: calc(14px * var(--font-scale)) 18px;
-  padding-top: calc(14px * var(--font-scale) + env(safe-area-inset-top));
+  padding-top: calc(
+    14px * var(--font-scale) + max(env(safe-area-inset-top), var(--sat, 0px))
+  );
   font-weight: 700;
   font-size: calc(1.08rem * var(--font-scale));
   border-bottom: 1px solid var(--border);
@@ -420,7 +422,9 @@ textarea.input {
   align-items: center;
   justify-content: center;
   padding: 20px;
-  padding-top: calc(20px + env(safe-area-inset-top));
+  padding-top: calc(
+    20px + max(env(safe-area-inset-top), var(--sat, 0px))
+  );
   padding-bottom: calc(20px + env(safe-area-inset-bottom));
   overflow-y: auto;
 }

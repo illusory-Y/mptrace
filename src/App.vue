@@ -16,6 +16,12 @@ onMounted(async () => {
   try {
     const info = await fetchEnvInfo()
     app.setEnvInfo(info)
+    // Android：状态栏物理像素换算为 CSS px，注入全局安全区变量做刘海避让
+    if (info.statusBarHeight > 0) {
+      const dpr = window.devicePixelRatio || 1
+      const cssPx = info.statusBarHeight / dpr
+      document.documentElement.style.setProperty('--sat', `${cssPx}px`)
+    }
   } catch {
     /* 忽略，进入引导时还会再试 */
   }

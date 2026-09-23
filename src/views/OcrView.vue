@@ -35,15 +35,9 @@ let imgNaturalH = 0
 
 const offEngine = onEngineStateChange((_s, text) => (engineText.value = text))
 
-watch(
-  () => ocrStore.seq,
-  () => consumePending(),
-)
-
 onMounted(() => {
   // 静默预加载模型，失败不打扰（点识别时会再次尝试并展示错误）
   void preloadEngine().catch(() => {})
-  consumePending()
   // 轮询对端连接状态，用于"导出并直接发送"按钮可用性
   peerPollTimer = window.setInterval(() => (peerReady.value = isPeerConnected()), 1500)
 })
@@ -54,7 +48,8 @@ onBeforeUnmount(() => {
   if (previewUrl.value) URL.revokeObjectURL(previewUrl.value)
 })
 
-function consumePending() {
+/** 手动载入互传页刚接收的图片（不自动载入，由用户自主选择） */
+function loadPending() {
   const p = ocrStore.consume()
   if (p) void loadBlob(p.blob, p.name)
 }
@@ -184,6 +179,14 @@ watch(resultLines, () => setTimeout(drawBoxes, 50))
 
     <div class="card">
       <h3>1. 选择图片</h3>
+      <button
+        v-if="ocrStore.pending"
+        class="btn btn-primary btn-lg btn-block"
+        style="margin-bottom: 10px"
+        @click="loadPending"
+      >
+        识别刚接收的图片：{{ ocrStore.pending.name }}
+      </button>
       <div class="grid-2">
         <button class="btn btn-lg" @click="pickAlbum">相册 / 文件选图</button>
         <button class="btn btn-lg" @click="pickCamera">相机拍照</button>

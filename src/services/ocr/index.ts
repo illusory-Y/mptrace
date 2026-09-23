@@ -62,6 +62,9 @@ async function initEngine(): Promise<void> {
       lang: 'ch',
       ocrVersion: 'PP-OCRv5',
       worker: useWorker,
+      // 使用本地打包的模型，离线加载、不依赖 bcebos 下载
+      textDetectionModelAsset: { url: modelUrl('PP-OCRv5_mobile_det.tar') },
+      textRecognitionModelAsset: { url: modelUrl('PP-OCRv5_mobile_rec.tar') },
       textDetectionBatchSize: 1,
       textRecognitionBatchSize: isAndroidWebView ? 3 : 6,
       ortOptions: {
@@ -90,6 +93,11 @@ async function initEngine(): Promise<void> {
     ocrInstance = null
     throw err
   }
+}
+
+/** 本地打包模型的绝对 URL（离线加载，无需联网下载，避免手机端一直卡在初始化） */
+function modelUrl(file: string): string {
+  return new URL(`${import.meta.env.BASE_URL}models/${file}`, window.location.href).href
 }
 
 const MAX_SRC_SIDE = 2048 // 超大照片先等比缩小，控制 WASM 内存

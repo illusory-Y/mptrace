@@ -289,7 +289,8 @@ fn cv_put<'a>(
     env.call_method(
         values,
         "put",
-        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        // ContentValues 没有 put(String,Object)，必须用具体类型；这里写入的都是字符串
+        "(Ljava/lang/String;Ljava/lang/String;)V",
         &[JValue::Object(&k), JValue::Object(&v)],
     )
     .map_err(|e| e.to_string())?;
@@ -366,7 +367,11 @@ where
     let mut guard = vm
         .attach_current_thread()
         .map_err(|e| format!("挂载 JVM 线程失败：{e}"))?;
-    f(&mut guard)
+    let result = f(&mut guard);
+    // 线程卸载（detach）前清掉任何残留异常；否则部分系统（含鸿蒙）检测到
+    // 未处理的 JNI 异常会直接中止进程（表现为接收完成瞬间闪退）。
+    let _ = guard.exception_clear();
+    result
 }
 
 fn current_activity<'a>(_env: &mut JNIEnv<'a>) -> Result<JObject<'a>, String> {

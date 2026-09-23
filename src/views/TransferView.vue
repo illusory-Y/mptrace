@@ -6,10 +6,12 @@ import { useAppStore } from '../stores/app'
 import { useOcrStore } from '../stores/ocr'
 import { SignalingClient } from '../services/signaling'
 import { NET_PATH_LABEL, TransferPeer } from '../services/webrtc'
+import { buildDefaultIce } from '../services/ice-config'
 import { setActivePeer } from '../services/peer-session'
 import { makePairQr, parsePairQr } from '../services/qr'
 import { formatBytes, formatSpeed } from '../services/files'
 import type { DeviceInfo, NetPathKind, PeerPhase, RecentPeer, TransferJob } from '../types'
+import LogModal from '../components/LogModal.vue'
 
 const app = useAppStore()
 const ocrStore = useOcrStore()
@@ -30,6 +32,7 @@ const dragOver = ref(false)
 const scanOpen = ref(false)
 const incomingCall = ref<{ from: DeviceInfo; callId: string } | null>(null)
 const showHotspot = ref(false)
+const showLog = ref(false)
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const cameraInput = ref<HTMLInputElement | null>(null)
@@ -64,11 +67,12 @@ function showToast(msg: string) {
 }
 
 function localIceServers(): RTCIceServer[] {
-  const urls = app.stunUrl
+  const defaults = buildDefaultIce()
+  const extra = app.stunUrl
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean)
-  return urls.length ? [{ urls }] : []
+  return extra.length ? [...defaults, { urls: extra }] : defaults
 }
 
 function buildIce(): RTCIceServer[] {
@@ -129,8 +133,9 @@ function makePeer(client: SignalingClient): TransferPeer {
     onNetPath: (k) => (netKind.value = k),
     onIncomingRequest: () => (showIncoming.value = true),
     onReceivedImage: (blob, display) => {
-      ocrStore.pushIncoming(blob, display || '接收的图片')
-      showToast('图片接收完成，已自动载入「识别」页，可直接识别')
+      const shortName = display.split('/').pop() || display || '接收的图片'
+      ocrStore.pushIncoming(blob, shortName)
+      showToast('图片已保存；可到「识别」页选择该图片识别')
     },
     onIncomingCall: (from, callId) => {
       incomingCall.value = { from, callId }
@@ -409,6 +414,9 @@ function onlyDigits(v: string) {
       <p style="text-align: center; margin: 12px 0 0">
         <button class="link-btn" @click="showHotspot = true">没有网络？开热点也能互传</button>
       </p>
+      <p style="text-align: center; margin: 2px 0 0">
+        <button class="link-btn" @click="showLog = true">查看运行日志</button>
+      </p>
     </div>
 
     <!-- 接收端面板 -->
@@ -440,7 +448,7 @@ function onlyDigits(v: string) {
       </p>
       <p class="muted" style="margin-bottom: 0">
         接收的文件将自动保存到：<b>{{ app.effectiveDirDisplay }}</b
-        >；接收到的图片会自动进入「识别」页。
+        >；图片可在「识别」页手动选择识别。
       </p>
     </div>
 
@@ -596,6 +604,9 @@ function onlyDigits(v: string) {
         <button class="btn btn-primary btn-lg btn-block" @click="showHotspot = false">我知道了</button>
       </div>
     </div>
+
+    <!-- 运行日志 -->
+    <LogModal :open="showLog" @close="showLog = false" />
 
     <!-- 扫码层 -->
     <div v-if="scanOpen" class="modal-mask" @click.self="closeScan">

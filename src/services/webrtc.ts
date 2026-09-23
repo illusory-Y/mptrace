@@ -16,6 +16,7 @@ import type {
   TransferRole,
 } from '../types'
 import { createReceivedWriter, timestampName, type ReceivedWriter } from './files'
+import { logger } from './logger'
 
 const CHUNK_SIZE = 64 * 1024 // 单帧 64KiB，兼容各平台 SCTP 实现
 const HIGH_WATER = 1024 * 1024 // 发送缓冲超过 1MiB 时暂停读文件
@@ -207,6 +208,7 @@ export class TransferPeer {
         }
         break
       case 'peer-left':
+        logger.warn('signal', '对方已离开')
         this.cb.onPhase('closed', '对方已离开')
         this.teardown()
         break
@@ -215,6 +217,7 @@ export class TransferPeer {
         this.teardown()
         break
       case 'error':
+        logger.error('signal', `服务器错误：${msg.message}`)
         this.cb.onPhase('error', msg.message)
         break
     }
@@ -254,6 +257,10 @@ export class TransferPeer {
   // ---------------- PC / Channel ----------------
 
   private createPc() {
+    logger.info(
+      'webrtc',
+      `创建 PeerConnection（ICE 服务器 ${this.iceServers.length} 组）`,
+    )
     this.pc = new RTCPeerConnection({
       iceServers: this.iceServers,
       iceCandidatePoolSize: 4,
@@ -261,20 +268,67 @@ export class TransferPeer {
     })
     this.pc.onicecandidate = (ev) => {
       if (ev.candidate) {
+        const c = ev.candidate
+        logger.debug(
+          'ice',
+          `本端候选 ${c.type} ${c.protocol} ${c.address || ''}:${c.port || ''}` +
+            (c.relatedAddress ? ` (via ${c.relatedAddress})` : ''),
+        )
         this.signaling.send({
           type: 'candidate',
-          candidate: ev.candidate.toJSON() as RTCIceCandidateInit,
+          candidate: c.toJSON() as RTCIceCandidateInit,
         })
+      } else {
+        logger.info('ice', '本端候选收集完成')
       }
+    }
+    this.pc.onicegatheringstatechange = () => {
+      logger.debug('ice', `gathering=${this.pc?.iceGatheringState}`)
+    }
+    this.pc.oniceconnectionstatechange = () => {
+      const s = this.pc?.iceConnectionState
+      logger.info('ice', `ICE 连接状态=${s}`)
+      if (s === 'failed') void this.dumpIceFailure('ICE failed')
     }
     this.pc.onconnectionstatechange = () => {
       const s = this.pc?.connectionState
+      logger.info('webrtc', `连接状态=${s}`)
       if (s === 'connected') {
         this.cb.onPhase('connected')
       } else if (s === 'failed') {
         // disconnected 多为网络抖动，ICE 会自行恢复，只有 failed 才判定失败
+        void this.dumpIceFailure('connection failed')
         this.cb.onPhase('error', '直连与中转均失败，请检查双方网络后重试')
       }
+    }
+  }
+
+  /** 连接失败时把候选对与本端候选类型写入日志，判断是 STUN 不通还是缺少 TURN */
+  private async dumpIceFailure(reason: string) {
+    if (!this.pc) return
+    try {
+      const stats = await this.pc.getStats()
+      const localKinds = new Set<string>()
+      let pairs = 0
+      stats.forEach((report) => {
+        const r = report as RTCStats & Record<string, unknown>
+        if (r.type === 'local-candidate' && r.candidateType) {
+          localKinds.add(String(r.candidateType))
+        }
+        if (r.type === 'candidate-pair') {
+          pairs++
+          logger.debug(
+            'ice',
+            `候选对 state=${r.state} nominated=${r.nominated === true}`,
+          )
+        }
+      })
+      logger.error(
+        'ice',
+        `${reason}；本端候选类型=[${[...localKinds].join(',') || '无'}]，候选对=${pairs}`,
+      )
+    } catch (e) {
+      logger.error('ice', `${reason}（读取统计失败：${(e as Error).message}）`)
     }
   }
 
@@ -283,11 +337,13 @@ export class TransferPeer {
     ch.binaryType = 'arraybuffer'
     ch.onopen = () => {
       this.closed = false
+      logger.info('channel', '数据通道已打开，可双向传输')
       this.cb.onPhase('connected')
       this.startSpeedTimer()
       this.startNetPathProbe()
     }
     ch.onclose = () => {
+      logger.warn('channel', '数据通道已关闭')
       this.stopSpeedTimer()
       // 未完成任务标记为中断
       let changed = false
@@ -299,7 +355,10 @@ export class TransferPeer {
       })
       if (changed) this.emitJobs()
     }
-    ch.onerror = () => {
+    ch.onerror = (ev) => {
+      const detail = (ev as unknown as { error?: { message?: string } }).error
+        ?.message
+      logger.error('channel', `数据通道异常：${detail || '未知错误'}`)
       this.cb.onPhase('error', '数据通道异常')
     }
     ch.onmessage = (ev) => {
@@ -334,6 +393,10 @@ export class TransferPeer {
   private async onMeta(ctrl: Extract<ChannelControl, { t: 'meta' }>) {
     this.currentRecvId = ctrl.id
     const name = timestampName(ctrl.name)
+    logger.info(
+      'recv',
+      `开始接收 ${ctrl.name}（${ctrl.size} 字节，${ctrl.mime || '未知类型'}）`,
+    )
     const job: TransferJob = {
       id: ctrl.id,
       name,
@@ -358,6 +421,7 @@ export class TransferPeer {
       job.state = 'done'
       job.transferred = job.size
       job.savedTo = saved?.display
+      logger.info('recv', `接收完成：${saved?.display || name}`)
       this.emitJobs()
       if (this.imageChunks) {
         const total = this.imageChunks.reduce((s, c) => s + c.length, 0)
@@ -373,6 +437,7 @@ export class TransferPeer {
     } catch (e) {
       job.state = 'error'
       job.error = (e as Error).message
+      logger.error('recv', `接收失败：${(e as Error).message}`)
       this.emitJobs()
     } finally {
       this.writer = null
@@ -427,6 +492,7 @@ export class TransferPeer {
       size: file.size,
       mime: file.type,
     }
+    logger.info('send', `开始发送 ${file.name}（${file.size} 字节）`)
     ch.send(JSON.stringify(meta))
     let offset = 0
     try {
@@ -447,9 +513,11 @@ export class TransferPeer {
       ch.send(JSON.stringify(done))
       job.state = 'done'
       job.transferred = job.size
+      logger.info('send', `发送完成：${file.name}`)
     } catch (e) {
       job.state = 'error'
       job.error = (e as Error).message
+      logger.error('send', `发送失败：${(e as Error).message}`)
     } finally {
       this.emitJobs()
     }

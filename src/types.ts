@@ -109,6 +109,8 @@ export interface EnvInfo {
   /** 默认保存目录（桌面为绝对路径；Android 为 content:// 常量标记） */
   defaultDir: string
   defaultDisplay: string
+  /** Android 状态栏高度（物理像素 px），用于刘海避让；其他平台为 0 */
+  statusBarHeight: number
 }
 
 export interface PickedDir {

@@ -21,10 +21,59 @@ const PORT = Number(process.env.PORT || 8787)
 const WS_PATH = process.env.WS_PATH || '/ws'
 const CODE_TTL_MS = Number(process.env.CODE_TTL_MS || 5 * 60_000)
 const TRUST_PROXY = process.env.TRUST_PROXY === 'true'
-const STUN_URL = process.env.STUN_URL || 'stun:stun.l.google.com:19302'
 const TURN_URL = process.env.TURN_URL || ''
 const TURN_USERNAME = process.env.TURN_USERNAME || ''
 const TURN_CREDENTIAL = process.env.TURN_CREDENTIAL || ''
+
+// 默认 STUN：Cloudflare（免费全球）+ 国内节点 + Google 兜底；
+// 显式设置 STUN_URL 时以其为准。
+const DEFAULT_STUN = [
+  'stun:stun.cloudflare.com:3478',
+  'stun:stun.qq.com:3478',
+  'stun:stun.miwifi.com:3478',
+  'stun:stun.l.google.com:19302',
+]
+const STUN_LIST = (process.env.STUN_URL ? process.env.STUN_URL.split(',') : DEFAULT_STUN)
+  .map((s) => s.trim())
+  .filter(Boolean)
+
+// 静态 TURN（环境变量显式配置时优先，且不再动态获取）
+const STATIC_TURN_URLS = TURN_URL.split(',').map((s) => s.trim()).filter(Boolean)
+const useStaticTurn = STATIC_TURN_URLS.length && TURN_USERNAME && TURN_CREDENTIAL
+
+// 动态 TURN：从 Cloudflare 公开（免费、无需账号）端点获取短期凭据并缓存。
+// 服务器在海外，固定出口 IP 低频拉取不会触发限流；失败则沿用上次凭据。
+const TURN_CREDS_URL = process.env.TURN_CREDS_URL || 'https://speed.cloudflare.com/turn-creds'
+const TURN_REFRESH_MS = Number(process.env.TURN_REFRESH_MS || 3 * 3600 * 1000)
+/** @type {{urls:string[], username:string, credential:string, fetchedAt:number}|null} */
+let dynamicTurn = null
+let turnFetching = null
+
+async function fetchDynamicTurn() {
+  if (useStaticTurn) return
+  if (turnFetching) return turnFetching
+  turnFetching = (async () => {
+    try {
+      const ctrl = new AbortController()
+      const timer = setTimeout(() => ctrl.abort(), 8000)
+      const r = await fetch(TURN_CREDS_URL, { signal: ctrl.signal })
+      clearTimeout(timer)
+      if (!r.ok) throw new Error('HTTP ' + r.status)
+      const d = await r.json()
+      if (!d || !d.username || !d.credential || !Array.isArray(d.urls)) {
+        throw new Error('凭据响应不完整')
+      }
+      const urls = d.urls.filter((u) => u.startsWith('turn'))
+      dynamicTurn = { urls, username: d.username, credential: d.credential, fetchedAt: Date.now() }
+      console.log('[turn] 动态凭据已刷新，中继', urls.length, '条')
+    } catch (e) {
+      console.warn('[turn] 动态凭据获取失败：' + e.message + (dynamicTurn ? '（沿用旧凭据）' : '（当前无中继）'))
+    } finally {
+      turnFetching = null
+    }
+  })()
+  return turnFetching
+}
 
 // 简单建房间限流：同一 IP 10 秒最多 12 次
 const RATE_WINDOW_MS = 10_000
@@ -33,15 +82,18 @@ const createHits = new Map()
 
 function buildIceServers() {
   const servers = []
-  const stun = STUN_URL.split(',').map((s) => s.trim()).filter(Boolean)
-  if (stun.length) servers.push({ urls: stun })
-  const turn = TURN_URL.split(',').map((s) => s.trim()).filter(Boolean)
-  if (turn.length && TURN_USERNAME && TURN_CREDENTIAL) {
-    servers.push({ urls: turn, username: TURN_USERNAME, credential: TURN_CREDENTIAL })
+  if (STUN_LIST.length) servers.push({ urls: STUN_LIST })
+  if (useStaticTurn) {
+    servers.push({ urls: STATIC_TURN_URLS, username: TURN_USERNAME, credential: TURN_CREDENTIAL })
+  } else if (dynamicTurn && dynamicTurn.urls.length) {
+    servers.push({
+      urls: dynamicTurn.urls,
+      username: dynamicTurn.username,
+      credential: dynamicTurn.credential,
+    })
   }
   return servers
 }
-const ICE_SERVERS = buildIceServers()
 
 /** @type {Map<string, {code:string, hostId:string, guestId:string|null, createdAt:number, timer:NodeJS.Timeout}>} */
 const rooms = new Map()
@@ -235,8 +287,8 @@ wss.on('connection', (ws, req) => {
         peer.name = String(msg.name || '未知设备')
         peer.kind = String(msg.kind || 'unknown')
         if (peer.deviceId) devices.set(peer.deviceId, peerId)
-        // 下发 ICE 配置（含私有 TURN 凭据）与配对码有效期
-        send(ws, { type: 'config', iceServers: ICE_SERVERS, ttlMs: CODE_TTL_MS })
+        // 下发 ICE 配置（含动态 TURN 凭据）与配对码有效期
+        send(ws, { type: 'config', iceServers: buildIceServers(), ttlMs: CODE_TTL_MS })
         break
       }
 
@@ -461,8 +513,24 @@ const heartbeat = setInterval(() => {
 
 wss.on('close', () => clearInterval(heartbeat))
 
-httpServer.listen(PORT, () => {
-  console.log(`信令服务已启动: ws://0.0.0.0:${PORT}${WS_PATH}`)
-  console.log(`健康检查: http://0.0.0.0:${PORT}/health`)
-  console.log(`配对码有效期: ${CODE_TTL_MS / 1000}s；TURN ${TURN_URL ? '已配置' : '未配置（仅 STUN，极端对称 NAT 可能无法连通）'}`)
-})
+async function start() {
+  // 启动前先取一次中继凭据（内部已容错，失败不阻塞启动）
+  await fetchDynamicTurn()
+  httpServer.listen(PORT, () => {
+    console.log(`信令服务已启动: ws://0.0.0.0:${PORT}${WS_PATH}`)
+    console.log(`健康检查: http://0.0.0.0:${PORT}/health`)
+    console.log(
+      `配对码有效期: ${CODE_TTL_MS / 1000}s；TURN ${
+        useStaticTurn ? '静态已配置' : dynamicTurn ? '动态已就绪' : '暂未就绪（将继续重试）'
+      }`,
+    )
+  })
+  // 每小时检查，超过刷新周期则重新获取
+  setInterval(() => {
+    if (useStaticTurn) return
+    const age = dynamicTurn ? Date.now() - dynamicTurn.fetchedAt : Infinity
+    if (age >= TURN_REFRESH_MS) void fetchDynamicTurn()
+  }, 60 * 60 * 1000)
+}
+
+void start()
