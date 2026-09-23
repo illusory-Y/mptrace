@@ -41,33 +41,89 @@ const STUN_LIST = (process.env.STUN_URL ? process.env.STUN_URL.split(',') : DEFA
 const STATIC_TURN_URLS = TURN_URL.split(',').map((s) => s.trim()).filter(Boolean)
 const useStaticTurn = STATIC_TURN_URLS.length && TURN_USERNAME && TURN_CREDENTIAL
 
-// 动态 TURN：从 Cloudflare 公开（免费、无需账号）端点获取短期凭据并缓存。
-// 服务器在海外，固定出口 IP 低频拉取不会触发限流；失败则沿用上次凭据。
+// ---- TURN 凭据来源（按优先级）----
+// 1) 静态 TURN（TURN_URL/USERNAME/CREDENTIAL 环境变量，最高优先）
+// 2) Cloudflare 正式 TURN key（TURN_KEY_ID + TURN_KEY_API_TOKEN，官方稳定，免费 1TB）
+// 3) Cloudflare 公开演示端点（无需账号，但会限流/拒绝数据中心 IP，仅兜底）
+const TURN_KEY_ID = process.env.TURN_KEY_ID || ''
+const TURN_KEY_API_TOKEN = process.env.TURN_KEY_API_TOKEN || ''
+const useCfKey = Boolean(TURN_KEY_ID && TURN_KEY_API_TOKEN)
+const CF_TTL = Number(process.env.CF_TURN_TTL || 86400)
 const TURN_CREDS_URL = process.env.TURN_CREDS_URL || 'https://speed.cloudflare.com/turn-creds'
-const TURN_REFRESH_MS = Number(process.env.TURN_REFRESH_MS || 3 * 3600 * 1000)
-/** @type {{urls:string[], username:string, credential:string, fetchedAt:number}|null} */
+const TURN_REFRESH_MS = Number(process.env.TURN_REFRESH_MS || 12 * 3600 * 1000)
+/** @type {{urls:string[], username:string, credential:string, fetchedAt:number}|null} 演示端点凭据 */
 let dynamicTurn = null
+/** @type {any[]|null} 正式 key 返回的完整 iceServers（含官方 STUN + TURN） */
+let cloudflareIce = null
 let turnFetching = null
+
+/** 用正式 TURN key 调官方 API，得到可直接下发的 iceServers */
+async function fetchViaCfKey() {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 10000)
+  let r
+  try {
+    r = await fetch(
+      `https://rtc.live.cloudflare.com/v1/turn/keys/${TURN_KEY_ID}/credentials/generate-ice-servers`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + TURN_KEY_API_TOKEN,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ ttl: CF_TTL }),
+        signal: ctrl.signal,
+      },
+    )
+  } finally {
+    clearTimeout(timer)
+  }
+  if (!r.ok) {
+    throw new Error('HTTP ' + r.status + ' ' + (await r.text().catch(() => '')).slice(0, 200))
+  }
+  const d = await r.json()
+  if (!Array.isArray(d.iceServers)) throw new Error('响应缺少 iceServers')
+  cloudflareIce = d.iceServers
+  console.log('[turn] Cloudflare key 凭据已刷新（' + d.iceServers.length + ' 组）')
+}
+
+/** 公开演示端点（无需账号，会限流） */
+async function fetchViaSpeed() {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 8000)
+  let r
+  try {
+    r = await fetch(TURN_CREDS_URL, { signal: ctrl.signal })
+  } finally {
+    clearTimeout(timer)
+  }
+  if (!r.ok) throw new Error('HTTP ' + r.status)
+  const d = await r.json()
+  if (!d || !d.username || !d.credential || !Array.isArray(d.urls)) {
+    throw new Error('凭据响应不完整')
+  }
+  const urls = d.urls.filter((u) => u.startsWith('turn'))
+  dynamicTurn = {
+    urls,
+    username: d.username,
+    credential: d.credential,
+    fetchedAt: Date.now(),
+  }
+  console.log('[turn] 演示端点凭据已刷新，中继 ' + urls.length + ' 条')
+}
 
 async function fetchDynamicTurn() {
   if (useStaticTurn) return
   if (turnFetching) return turnFetching
   turnFetching = (async () => {
     try {
-      const ctrl = new AbortController()
-      const timer = setTimeout(() => ctrl.abort(), 8000)
-      const r = await fetch(TURN_CREDS_URL, { signal: ctrl.signal })
-      clearTimeout(timer)
-      if (!r.ok) throw new Error('HTTP ' + r.status)
-      const d = await r.json()
-      if (!d || !d.username || !d.credential || !Array.isArray(d.urls)) {
-        throw new Error('凭据响应不完整')
-      }
-      const urls = d.urls.filter((u) => u.startsWith('turn'))
-      dynamicTurn = { urls, username: d.username, credential: d.credential, fetchedAt: Date.now() }
-      console.log('[turn] 动态凭据已刷新，中继', urls.length, '条')
+      if (useCfKey) await fetchViaCfKey()
+      else await fetchViaSpeed()
     } catch (e) {
-      console.warn('[turn] 动态凭据获取失败：' + e.message + (dynamicTurn ? '（沿用旧凭据）' : '（当前无中继）'))
+      const have = cloudflareIce || dynamicTurn
+      console.warn(
+        '[turn] 凭据获取失败：' + e.message + (have ? '（沿用旧凭据）' : '（当前无中继）'),
+      )
     } finally {
       turnFetching = null
     }
@@ -81,18 +137,29 @@ const RATE_MAX = 12
 const createHits = new Map()
 
 function buildIceServers() {
-  const servers = []
-  if (STUN_LIST.length) servers.push({ urls: STUN_LIST })
   if (useStaticTurn) {
-    servers.push({ urls: STATIC_TURN_URLS, username: TURN_USERNAME, credential: TURN_CREDENTIAL })
-  } else if (dynamicTurn && dynamicTurn.urls.length) {
-    servers.push({
-      urls: dynamicTurn.urls,
-      username: dynamicTurn.username,
-      credential: dynamicTurn.credential,
-    })
+    return [
+      { urls: STUN_LIST },
+      { urls: STATIC_TURN_URLS, username: TURN_USERNAME, credential: TURN_CREDENTIAL },
+    ]
   }
-  return servers
+  if (cloudflareIce) {
+    // 国内 STUN 增强在前（Cloudflare 自带 stun 已在 cloudflareIce 内）
+    const extraStun = STUN_LIST.filter((u) => !u.includes('cloudflare'))
+    const head = extraStun.length ? [{ urls: extraStun }] : []
+    return head.concat(cloudflareIce)
+  }
+  if (dynamicTurn && dynamicTurn.urls.length) {
+    return [
+      { urls: STUN_LIST },
+      {
+        urls: dynamicTurn.urls,
+        username: dynamicTurn.username,
+        credential: dynamicTurn.credential,
+      },
+    ]
+  }
+  return [{ urls: STUN_LIST }]
 }
 
 /** @type {Map<string, {code:string, hostId:string, guestId:string|null, createdAt:number, timer:NodeJS.Timeout}>} */
@@ -521,14 +588,25 @@ async function start() {
     console.log(`健康检查: http://0.0.0.0:${PORT}/health`)
     console.log(
       `配对码有效期: ${CODE_TTL_MS / 1000}s；TURN ${
-        useStaticTurn ? '静态已配置' : dynamicTurn ? '动态已就绪' : '暂未就绪（将继续重试）'
+        useStaticTurn
+          ? '静态已配置'
+          : cloudflareIce
+            ? 'Cloudflare key 已就绪'
+            : dynamicTurn
+              ? '演示端点已就绪'
+              : '暂未就绪（将继续重试）'
       }`,
     )
   })
   // 每小时检查，超过刷新周期则重新获取
   setInterval(() => {
     if (useStaticTurn) return
-    const age = dynamicTurn ? Date.now() - dynamicTurn.fetchedAt : Infinity
+    // 正式 key 按固定周期重签；演示端点按凭据获取时间判断
+    const age = useCfKey
+      ? TURN_REFRESH_MS
+      : dynamicTurn
+        ? Date.now() - dynamicTurn.fetchedAt
+        : Infinity
     if (age >= TURN_REFRESH_MS) void fetchDynamicTurn()
   }, 60 * 60 * 1000)
 }
