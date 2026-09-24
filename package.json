@@ -1,6 +1,6 @@
 {
   "name": "local-transfer-suite",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "description": "Vue3 + Tauri 2 跨端（Windows / Android）本地 OCR + 全网通点对点文件互传（仅个人/小范围私下使用，禁止公开分发、上架、商用）",
   "type": "module",
