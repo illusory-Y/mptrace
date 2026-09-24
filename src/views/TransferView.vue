@@ -10,6 +10,7 @@ import { buildDefaultIce } from '../services/ice-config'
 import { setActivePeer } from '../services/peer-session'
 import { makePairQr, parsePairQr } from '../services/qr'
 import { formatBytes, formatSpeed } from '../services/files'
+import { openSavedFile } from '../services/tauri'
 import type { DeviceInfo, NetPathKind, PeerPhase, RecentPeer, TransferJob } from '../types'
 import LogModal from '../components/LogModal.vue'
 
@@ -310,6 +311,15 @@ function cancelJob(id: string) {
   peer?.cancelJob(id)
 }
 
+async function openJobFile(job: TransferJob) {
+  if (!job.savedUri) return
+  try {
+    await openSavedFile(job.savedUri, job.savedMime || job.mime)
+  } catch (e) {
+    showToast(`无法打开文件：${(e as Error).message}`)
+  }
+}
+
 // ---------- 扫码 ----------
 async function openScan() {
   scanOpen.value = true
@@ -557,7 +567,12 @@ function onlyDigits(v: string) {
         </div>
         <div class="muted row" style="justify-content: space-between">
           <span>{{ pct(job) }}% · {{ formatSpeed(job.speed) }}</span>
-          <span v-if="job.savedTo">已保存到：{{ job.savedTo }}</span>
+          <span v-if="job.savedTo" class="row" style="gap: 8px; justify-content: flex-end">
+            <span>已保存到：{{ job.savedTo }}</span>
+            <button v-if="job.savedUri" class="btn btn-ghost" style="min-height: 32px; padding: 0 10px" @click="openJobFile(job)">
+              打开文件
+            </button>
+          </span>
           <span v-else-if="job.error" style="color: var(--danger)">{{ job.error }}</span>
         </div>
       </div>

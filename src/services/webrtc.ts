@@ -22,6 +22,8 @@ const CHUNK_SIZE = 64 * 1024 // 单帧 64KiB，兼容各平台 SCTP 实现
 const HIGH_WATER = 1024 * 1024 // 发送缓冲超过 1MiB 时暂停读文件
 const LOW_WATER = 256 * 1024 // 回落到 256KiB 以下继续
 const SPEED_TICK_MS = 800
+// 接收图片只为 OCR 预览保留一份副本；大图直接保存，避免完成时再次分配整张图片导致 Android OOM。
+const MAX_PREVIEW_IMAGE_BYTES = 8 * 1024 * 1024
 
 export interface PeerCallbacks {
   onPhase: (phase: PeerPhase, detail?: string) => void
@@ -59,6 +61,7 @@ export class TransferPeer {
   private writer: ReceivedWriter | null = null
   private currentRecvId: string | null = null
   private imageChunks: Uint8Array[] | null = null
+  private imageBytes = 0
   private recvQueue: Promise<void> = Promise.resolve()
   private speedTimer: number | null = null
   private lastTickBytes = new Map<string, number>()
@@ -386,7 +389,16 @@ export class TransferPeer {
     const job = this.jobs.find((j) => j.id === this.currentRecvId)
     if (!job || !this.writer) return
     await this.writer.append(bytes)
-    if (this.imageChunks) this.imageChunks.push(bytes)
+    if (this.imageChunks) {
+      if (this.imageBytes + bytes.length <= MAX_PREVIEW_IMAGE_BYTES) {
+        this.imageChunks.push(bytes)
+        this.imageBytes += bytes.length
+      } else {
+        // 文件仍完整保存，但不再为 OCR 预览继续复制内存。
+        this.imageChunks = null
+        this.imageBytes = 0
+      }
+    }
     job.transferred += bytes.length
   }
 
@@ -409,19 +421,34 @@ export class TransferPeer {
     }
     this.upsertJob(job)
     this.writer = createReceivedWriter()
-    await this.writer.create(this.cb.getSaveDir(), name, job.mime)
+    try {
+      await this.writer.create(this.cb.getSaveDir(), name, job.mime)
+    } catch (e) {
+      job.state = 'error'
+      job.error = (e as Error).message
+      logger.error('recv', `创建保存会话失败：${job.error}`)
+      this.writer = null
+      this.currentRecvId = null
+      this.emitJobs()
+      return
+    }
     this.imageChunks = job.mime.startsWith('image/') ? [] : null
+    this.imageBytes = 0
   }
 
   private async onDone(id: string) {
     const job = this.jobs.find((j) => j.id === id)
     if (!job) return
+    const writer = this.writer
     try {
-      const saved = await this.writer?.finish()
+      if (!writer) throw new Error('接收写入会话不存在')
+      const saved = await writer.finish()
       job.state = 'done'
       job.transferred = job.size
-      job.savedTo = saved?.display
-      logger.info('recv', `接收完成：${saved?.display || name}`)
+      job.savedTo = saved.display
+      job.savedUri = saved.uri
+      job.savedMime = job.mime
+      logger.info('recv', `接收完成：${saved.display || job.name}`)
       this.emitJobs()
       if (this.imageChunks) {
         const total = this.imageChunks.reduce((s, c) => s + c.length, 0)
@@ -432,16 +459,18 @@ export class TransferPeer {
           off += c.length
         }
         const blob = new Blob([merged], { type: job.mime })
-        this.cb.onReceivedImage(blob, saved?.display || '')
+        this.cb.onReceivedImage(blob, saved.display)
       }
     } catch (e) {
+      await writer?.cancel().catch(() => {})
       job.state = 'error'
       job.error = (e as Error).message
-      logger.error('recv', `接收失败：${(e as Error).message}`)
+      logger.error('recv', `接收失败：${job.error}`)
       this.emitJobs()
     } finally {
       this.writer = null
       this.imageChunks = null
+      this.imageBytes = 0
       this.currentRecvId = null
     }
   }

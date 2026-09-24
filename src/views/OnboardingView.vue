@@ -11,6 +11,7 @@ const app = useAppStore()
 const step = ref<1 | 2>(1)
 const agreed = ref(false)
 const busy = ref(false)
+const androidSubdirDraft = ref(app.androidDownloadSubdir)
 const errorMsg = ref('')
 
 onMounted(async () => {
@@ -39,6 +40,11 @@ async function chooseDir() {
   } finally {
     busy.value = false
   }
+}
+
+function saveAndroidSubdir() {
+  app.setAndroidDownloadSubdir(androidSubdirDraft.value)
+  androidSubdirDraft.value = app.androidDownloadSubdir
 }
 
 function enterApp() {
@@ -86,7 +92,17 @@ function enterApp() {
         </div>
         <p v-if="errorMsg" class="notice warn">{{ errorMsg }}</p>
         <div class="col">
-          <button class="btn btn-primary btn-lg btn-block" :disabled="busy" @click="chooseDir">
+          <template v-if="app.platform === 'android'">
+            <label class="muted" for="onboard-android-subdir">Download 子目录（可选）</label>
+            <div class="row">
+              <input id="onboard-android-subdir" class="input" v-model="androidSubdirDraft" placeholder="例如：MPTrace" />
+              <button class="btn btn-primary" @click="saveAndroidSubdir">保存</button>
+            </div>
+            <p class="muted" style="margin: 0">
+              Android 安装版默认保存到公共 Download；填写子目录后会保存到 Download/子目录。
+            </p>
+          </template>
+          <button v-else class="btn btn-primary btn-lg btn-block" :disabled="busy" @click="chooseDir">
             选择目录
           </button>
           <button class="btn btn-lg btn-block" @click="app.backToDefault()">

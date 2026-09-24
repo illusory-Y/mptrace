@@ -1,7 +1,7 @@
 // ============================================================
 // Tauri 2 后端命令层
 // 桌面（Windows/macOS/Linux）：std::fs 直接写入用户选择的文件夹
-// Android：MediaStore Downloads（默认）或 SAF 用户目录（platform_android.rs）
+// Android：MediaStore Downloads（默认/可选子目录）或 SAF 用户目录（platform_android.rs）
 // 所有文件写入都必须经过这里，保证"统一保存目录、不随机落盘"
 // ============================================================
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -12,6 +12,8 @@ use std::io::Write;
 #[cfg(not(target_os = "android"))]
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(not(target_os = "android"))]
+use std::process::Command;
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
 
@@ -100,8 +102,8 @@ async fn pick_directory(app: AppHandle) -> Result<Option<PickedDir>, String> {
     }
     #[cfg(target_os = "android")]
     {
-        // Android 上 tauri-plugin-dialog 不支持 pick_folder，
-        // 直接返回默认下载目录（MediaStore.Downloads）
+        // Android 上 tauri-plugin-dialog 不支持 pick_folder；
+        // 安装版由前端配置 Download 子目录，保留默认目录作为兼容回退。
         let uri = "content://media/external/downloads".to_string();
         let display = "公共下载目录".to_string();
         Ok(Some(PickedDir { uri, display }))
@@ -132,6 +134,41 @@ async fn save_small_file(
         .decode(b64)
         .map_err(|e| format!("base64 解码失败：{e}"))?;
     platform_save(&dir, &name, &mime, &bytes)
+}
+
+#[tauri::command]
+async fn open_saved_file(uri: String, mime: String) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        return platform_android::open_file(&uri, &mime);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg(format!("/select,{}", uri))
+            .spawn()
+            .map_err(|e| format!("打开文件位置失败：{e}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .args(["-R", &uri])
+            .spawn()
+            .map_err(|e| format!("打开文件位置失败：{e}"))?;
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let parent = Path::new(&uri).parent().unwrap_or_else(|| Path::new("."));
+        Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map_err(|e| format!("打开文件位置失败：{e}"))?;
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    Err("当前平台暂不支持打开文件位置".to_string())
 }
 
 // ---------------- 大文件流式接收会话（互传） ----------------
@@ -307,7 +344,8 @@ pub fn run() {
             create_write_session,
             append_write_session,
             finish_write_session,
-            cancel_write_session
+            cancel_write_session,
+            open_saved_file
         ])
         .run(tauri::generate_context!())
         .expect("启动应用失败");

@@ -1,6 +1,6 @@
 [package]
 name = "local-transfer-suite"
-version = "1.0.2"
+version = "1.0.3"
 description = "本地 OCR + 点对点文件互传（个人/小范围私下使用）"
 authors = ["you"]
 edition = "2021"
@@ -26,6 +26,7 @@ dirs = "5"
 [target.'cfg(target_os = "android")'.dependencies]
 ndk-context = "0.1.1"
 jni = "0.21"
+libc = "0.2"
 
 [profile.release]
 panic = "abort"

@@ -8,6 +8,6 @@ export const RISK_PARAGRAPHS: string[] = [
   '5. 禁止公开分发、上架应用商店、禁止商用。',
 ]
 
-export const APP_VERSION = '1.0.0'
+export const APP_VERSION = '1.0.3'
 
 export const PAIR_CODE_TTL_MS = 5 * 60 * 1000

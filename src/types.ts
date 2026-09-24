@@ -31,6 +31,10 @@ export interface TransferJob {
   error?: string
   /** 接收完成后，Tauri 端返回的保存位置描述；浏览器调试模式下为 blobUrl */
   savedTo?: string
+  /** 接收完成后用于打开文件的 URI */
+  savedUri?: string
+  /** 保存文件的 MIME 类型 */
+  savedMime?: string
   /** 接收到的图片，用于自动载入 OCR */
   imageDataUrl?: string
 }

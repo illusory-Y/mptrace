@@ -24,3 +24,12 @@ export async function pickDirectory(): Promise<PickedDir | null> {
   const picked = await invoke<PickedDir | null>('pick_directory')
   return picked ?? null
 }
+/** 打开已保存文件；Android 交给系统文件查看器，桌面交给系统文件管理器。 */
+export async function openSavedFile(uri: string, mime = 'application/octet-stream'): Promise<void> {
+  if (!uri) throw new Error('保存位置为空')
+  if (!isTauri) {
+    window.open(uri, '_blank', 'noopener,noreferrer')
+    return
+  }
+  await invoke('open_saved_file', { uri, mime })
+}

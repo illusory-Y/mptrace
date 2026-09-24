@@ -16,6 +16,10 @@ interface AppState {
   useDefaultDir: boolean
   defaultDir: string
   defaultDisplay: string
+  /** 当前运行平台，用于 Android 专属存储策略 */
+  platform: EnvInfo['os']
+  /** Android 公共 Download 下的自定义子目录 */
+  androidDownloadSubdir: string
   saveDirUri: string
   saveDirDisplay: string
   signalUrl: string
@@ -52,6 +56,18 @@ function loadPersisted(): Partial<AppState> {
   } catch {
     return {}
   }
+}
+
+/** Android 只允许在公共 Download 下配置子目录，避免保存到不可访问的伪路径。 */
+function normalizeAndroidDownloadSubdir(value: string): string {
+  return value
+    .trim()
+    .replace(/\\/g, '/')
+    .split('/')
+    .map((part) => part.trim())
+    .filter((part) => part && part !== '.' && part !== '..')
+    .join('/')
+    .slice(0, 120)
 }
 
 function normalizePeerKind(kind: unknown): DeviceInfo['kind'] {
@@ -129,6 +145,8 @@ export const useAppStore = defineStore('app', {
       saveDirUri: '',
       saveDirDisplay: '',
       ...persisted,
+      platform: 'web',
+      androidDownloadSubdir: normalizeAndroidDownloadSubdir(persisted.androidDownloadSubdir || ''),
       // 持久化里的空信令/STUN 地址不覆盖默认值
       signalUrl: persisted.signalUrl || defaultSignalUrl(),
       stunUrl:
@@ -145,10 +163,18 @@ export const useAppStore = defineStore('app', {
   getters: {
     /** 所有文件写入唯一使用的目录标识（桌面路径 / Android content URI） */
     effectiveDir(state): string {
-      return state.useDefaultDir ? state.defaultDir : state.saveDirUri
+      if (!state.useDefaultDir) return state.saveDirUri
+      if (state.platform === 'android' && state.androidDownloadSubdir) {
+        return `android-downloads://${encodeURIComponent(state.androidDownloadSubdir)}`
+      }
+      return state.defaultDir
     },
     effectiveDirDisplay(state): string {
-      return state.useDefaultDir ? state.defaultDisplay : state.saveDirDisplay
+      if (!state.useDefaultDir) return state.saveDirDisplay
+      if (state.platform === 'android' && state.androidDownloadSubdir) {
+        return `公共下载目录 / Download/${state.androidDownloadSubdir}`
+      }
+      return state.defaultDisplay
     },
   },
   actions: {
@@ -160,6 +186,8 @@ export const useAppStore = defineStore('app', {
         useDefaultDir: this.useDefaultDir,
         defaultDir: this.defaultDir,
         defaultDisplay: this.defaultDisplay,
+        platform: this.platform,
+        androidDownloadSubdir: this.androidDownloadSubdir,
         saveDirUri: this.saveDirUri,
         saveDirDisplay: this.saveDirDisplay,
         signalUrl: this.signalUrl,
@@ -176,6 +204,7 @@ export const useAppStore = defineStore('app', {
       document.documentElement.dataset.font = this.fontScale
     },
     setEnvInfo(info: EnvInfo) {
+      this.platform = info.os
       // 仅在首次获取时写入默认目录
       if (!this.defaultDir) {
         this.defaultDir = info.defaultDir
@@ -204,6 +233,11 @@ export const useAppStore = defineStore('app', {
       return true
     },
     backToDefault() {
+      this.useDefaultDir = true
+      this.persist()
+    },
+    setAndroidDownloadSubdir(value: string) {
+      this.androidDownloadSubdir = normalizeAndroidDownloadSubdir(value)
       this.useDefaultDir = true
       this.persist()
     },

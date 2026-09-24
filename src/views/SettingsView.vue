@@ -8,6 +8,7 @@ const app = useAppStore()
 const showRisk = ref(false)
 const signalDraft = ref(app.signalUrl)
 const stunDraft = ref(app.stunUrl)
+const androidSubdirDraft = ref(app.androidDownloadSubdir)
 const toast = ref('')
 let timer: number | undefined
 
@@ -32,6 +33,12 @@ function saveSignal() {
   app.persist()
   flash('已保存；请在互传页重新发起连接以使用新配置')
 }
+
+function saveAndroidSubdir() {
+  app.setAndroidDownloadSubdir(androidSubdirDraft.value)
+  androidSubdirDraft.value = app.androidDownloadSubdir
+  flash(app.androidDownloadSubdir ? '已设置 Download 子目录' : '已恢复直接保存到 Download')
+}
 </script>
 
 <template>
@@ -44,14 +51,27 @@ function saveSignal() {
         {{ app.effectiveDirDisplay || '尚未设置' }}
         <div v-if="app.useDefaultDir" class="muted">当前：系统默认（下载 / Download）</div>
       </div>
-      <div class="grid-2">
+      <div v-if="app.platform === 'android'" class="col" style="gap: 8px">
+        <label class="muted" for="android-download-subdir">Android Download 子目录（可选）</label>
+        <div class="row">
+          <input id="android-download-subdir" class="input" v-model="androidSubdirDraft" placeholder="例如：MPTrace" />
+          <button class="btn btn-primary" @click="saveAndroidSubdir">保存</button>
+        </div>
+        <button class="btn btn-lg" @click="androidSubdirDraft = ''; saveAndroidSubdir()">
+          恢复直接保存到 Download
+        </button>
+        <p class="muted" style="margin-bottom: 0">
+          Android 系统目录选择器不支持应用直接选文件夹；这里可设置 Download 下的子目录，文件仍由系统存储管理。
+        </p>
+      </div>
+      <div v-else class="grid-2">
         <button class="btn btn-primary btn-lg" @click="changeDir">更改保存目录</button>
         <button class="btn btn-lg" @click="app.backToDefault(); flash('已恢复为系统默认下载目录')">
           恢复默认目录
         </button>
       </div>
-      <p class="muted" style="margin-bottom: 0">
-        安卓通过系统存储访问框架（SAF）选择目录，兼容 Android 11+，无需"所有文件"权限。
+      <p v-if="app.platform !== 'android'" class="muted" style="margin-bottom: 0">
+        桌面端可直接选择本地文件夹，互传和 OCR 导出统一写入该目录。
       </p>
     </div>
 
