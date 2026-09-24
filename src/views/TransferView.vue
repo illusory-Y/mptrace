@@ -41,6 +41,8 @@ const videoEl = ref<HTMLVideoElement | null>(null)
 let signaling: SignalingClient | null = null
 let peer: TransferPeer | null = null
 let serverIce: RTCIceServer[] = []
+let iceConfigReady: Promise<void> | null = null
+let resolveIceConfig: (() => void) | null = null
 let countdownTimer: number | null = null
 let scanner: BrowserMultiFormatReader | null = null
 let scanControls: IScannerControls | null = null
@@ -96,8 +98,15 @@ async function ensureSignal(): Promise<SignalingClient> {
   }
   signalState.value = 'connecting'
   const client = new SignalingClient()
+  iceConfigReady = new Promise<void>((resolve) => {
+    resolveIceConfig = resolve
+  })
   client.onMessage((msg) => {
-    if (msg.type === 'config') serverIce = msg.iceServers
+    if (msg.type === 'config') {
+      serverIce = msg.iceServers
+      resolveIceConfig?.()
+      resolveIceConfig = null
+    }
   })
   client.onStatus((s, detail) => {
     signalState.value = s === 'open' ? 'open' : 'closed'
@@ -114,6 +123,14 @@ async function ensureSignal(): Promise<SignalingClient> {
   signaling = client
   signalState.value = 'open'
   return client
+}
+
+async function waitForIceConfig() {
+  if (serverIce.length) return
+  await Promise.race([
+    iceConfigReady ?? Promise.resolve(),
+    new Promise<void>((resolve) => window.setTimeout(resolve, 5000)),
+  ])
 }
 
 function makePeer(client: SignalingClient): TransferPeer {
@@ -157,7 +174,7 @@ async function becomeReceiver() {
     netKind.value = 'unknown'
     const client = await ensureSignal()
     peer = registerPeer(client)
-    await tick(220) // 等服务端把 TURN/STUN 配置下发到位
+    await waitForIceConfig()
     await peer.startAsReceiver(buildIce())
   } catch (e) {
     showToast((e as Error).message)
@@ -172,7 +189,7 @@ async function becomeSender() {
     netKind.value = 'unknown'
     const client = await ensureSignal()
     peer = registerPeer(client)
-    await tick(220)
+    await waitForIceConfig()
     phase.value = 'idle'
     phaseDetail.value = '请输入对方屏幕上的 6 位配对码，或扫描二维码'
   } catch (e) {
@@ -219,7 +236,7 @@ async function reconnect(rp: RecentPeer) {
     if (!peer) peer = registerPeer(client)
     role.value = 'sender'
     netKind.value = 'unknown'
-    await tick(120)
+    await waitForIceConfig()
     await peer.startCall(rp.deviceId, buildIce())
   } catch (e) {
     showToast((e as Error).message)

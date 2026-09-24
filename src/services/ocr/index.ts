@@ -60,7 +60,8 @@ async function initEngine(): Promise<void> {
     setState('loading', isAndroidWebView ? '正在初始化（兼容模式）…' : '正在初始化 WASM 运行时…')
     ocrInstance = await PaddleOCR.create({
       lang: 'ch',
-      ocrVersion: 'PP-OCRv5',
+      textDetectionModelName: 'PP-OCRv5_mobile_det',
+      textRecognitionModelName: 'PP-OCRv5_mobile_rec',
       worker: useWorker,
       // 使用本地打包的模型，离线加载、不依赖 bcebos 下载
       textDetectionModelAsset: { url: modelUrl('PP-OCRv5_mobile_det.tar') },

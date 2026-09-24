@@ -9,9 +9,9 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
 #[cfg(not(target_os = "android"))]
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
 
@@ -128,7 +128,9 @@ async fn save_small_file(
     mime: String,
     b64: String,
 ) -> Result<SavedFile, String> {
-    let bytes = STANDARD.decode(b64).map_err(|e| format!("base64 解码失败：{e}"))?;
+    let bytes = STANDARD
+        .decode(b64)
+        .map_err(|e| format!("base64 解码失败：{e}"))?;
     platform_save(&dir, &name, &mime, &bytes)
 }
 
@@ -152,11 +154,15 @@ async fn create_write_session(
     fs::create_dir_all(&cache).map_err(|e| format!("创建缓存目录失败：{e}"))?;
     let tmp = cache.join(format!(".pts_recv_{id}.part"));
     File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?;
-    state
-        .sessions
-        .lock()
-        .map_err(poison)?
-        .insert(id, WriteSession { dir, name, mime, tmp });
+    state.sessions.lock().map_err(poison)?.insert(
+        id,
+        WriteSession {
+            dir,
+            name,
+            mime,
+            tmp,
+        },
+    );
     Ok(id)
 }
 
@@ -173,7 +179,9 @@ async fn append_write_session(
             .ok_or_else(|| format!("写入会话 {id} 不存在"))?;
         s.tmp.clone()
     };
-    let bytes = STANDARD.decode(b64).map_err(|e| format!("base64 解码失败：{e}"))?;
+    let bytes = STANDARD
+        .decode(b64)
+        .map_err(|e| format!("base64 解码失败：{e}"))?;
     let mut f = OpenOptions::new()
         .append(true)
         .open(&tmp)
@@ -183,19 +191,26 @@ async fn append_write_session(
 }
 
 #[tauri::command]
-async fn finish_write_session(
-    state: State<'_, AppState>,
-    id: u64,
-) -> Result<SavedFile, String> {
+async fn finish_write_session(state: State<'_, AppState>, id: u64) -> Result<SavedFile, String> {
     let session = state
         .sessions
         .lock()
         .map_err(poison)?
         .remove(&id)
         .ok_or_else(|| format!("写入会话 {id} 不存在"))?;
-    let bytes = fs::read(&session.tmp).map_err(|e| format!("读取临时文件失败：{e}"))?;
+    #[cfg(target_os = "android")]
+    let saved = platform_android::save_file_from_path(
+        &session.dir,
+        &session.name,
+        &session.mime,
+        &session.tmp,
+    );
+
+    #[cfg(not(target_os = "android"))]
+    let saved = move_temp_file(&session.dir, &session.name, &session.tmp);
+
     let _ = fs::remove_file(&session.tmp);
-    platform_save(&session.dir, &session.name, &session.mime, &bytes)
+    saved
 }
 
 #[tauri::command]
@@ -210,6 +225,19 @@ fn poison<T>(_: T) -> String {
     "内部状态锁异常".to_string()
 }
 
+#[cfg(not(target_os = "android"))]
+fn move_temp_file(dir: &str, name: &str, tmp: &PathBuf) -> Result<SavedFile, String> {
+    let dir = Path::new(dir);
+    fs::create_dir_all(dir).map_err(|e| format!("创建保存目录失败：{e}"))?;
+    let target = unique_path(dir, name);
+    if fs::rename(tmp, &target).is_err() {
+        fs::copy(tmp, &target).map_err(|e| format!("复制文件失败：{e}"))?;
+    }
+    Ok(SavedFile {
+        uri: target.to_string_lossy().to_string(),
+        display: target.display().to_string(),
+    })
+}
 // ---------------- 平台分发 ----------------
 
 #[cfg(not(target_os = "android"))]
