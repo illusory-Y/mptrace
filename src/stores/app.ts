@@ -54,6 +54,52 @@ function loadPersisted(): Partial<AppState> {
   }
 }
 
+function normalizePeerKind(kind: unknown): DeviceInfo['kind'] {
+  return kind === 'computer' || kind === 'phone' ? kind : 'unknown'
+}
+
+function normalizePeerName(name: unknown): string {
+  return typeof name === 'string' ? name.trim().toLocaleLowerCase().replace(/\s+/g, ' ') : ''
+}
+
+/**
+ * deviceId 是首选身份；当旧记录来自重新安装、清理站点数据或不同客户端时，
+ * 用设备名称和类型把同一台机器的历史身份合并起来。
+ */
+function samePeer(a: DeviceInfo, b: DeviceInfo): boolean {
+  if (a.deviceId && b.deviceId && a.deviceId === b.deviceId) return true
+
+  const nameA = normalizePeerName(a.name)
+  const nameB = normalizePeerName(b.name)
+  if (!nameA || nameA !== nameB) return false
+
+  const kindA = normalizePeerKind(a.kind)
+  const kindB = normalizePeerKind(b.kind)
+  return kindA === kindB || kindA === 'unknown' || kindB === 'unknown'
+}
+
+function dedupeRecentPeers(peers: unknown[]): RecentPeer[] {
+  const normalized = peers
+    .filter((peer): peer is Record<string, unknown> => !!peer && typeof peer === 'object')
+    .map((peer): RecentPeer => ({
+      deviceId: typeof peer.deviceId === 'string' ? peer.deviceId : '',
+      name: typeof peer.name === 'string' && peer.name.trim() ? peer.name.trim() : '未命名设备',
+      kind: normalizePeerKind(peer.kind),
+      lastConnectedAt:
+        typeof peer.lastConnectedAt === 'number' && Number.isFinite(peer.lastConnectedAt)
+          ? peer.lastConnectedAt
+          : 0,
+    }))
+    .filter((peer) => peer.deviceId)
+    .sort((a, b) => b.lastConnectedAt - a.lastConnectedAt)
+
+  const unique: RecentPeer[] = []
+  for (const peer of normalized) {
+    if (!unique.some((existing) => samePeer(existing, peer))) unique.push(peer)
+  }
+  return unique.slice(0, 5)
+}
+
 /** 信令地址默认值：Tauri 用 .env；浏览器模式默认与当前网页同源（部署到公网时自动跟随 https/wss） */
 function defaultSignalUrl(): string {
   const envSignal = import.meta.env.VITE_SIGNAL_URL ?? ''
@@ -93,7 +139,7 @@ export const useAppStore = defineStore('app', {
       deviceId: persisted.deviceId || genDeviceId(),
       deviceKind: kind,
       deviceName: persisted.deviceName || (kind === 'phone' ? '我的手机' : '我的电脑'),
-      recentPeers: Array.isArray(persisted.recentPeers) ? persisted.recentPeers : [],
+      recentPeers: dedupeRecentPeers(persisted.recentPeers ?? []),
     }
   },
   getters: {
@@ -181,15 +227,13 @@ export const useAppStore = defineStore('app', {
     /** 配对成功后记住对方设备（去重、最多 5 个、按时间倒序） */
     addRecentPeer(info: DeviceInfo) {
       if (!info.deviceId) return
-      const kind =
-        info.kind === 'computer' || info.kind === 'phone' ? info.kind : 'unknown'
-      const others = this.recentPeers.filter((p) => p.deviceId !== info.deviceId)
       const entry: RecentPeer = {
         deviceId: info.deviceId,
-        name: info.name || '未命名设备',
-        kind,
+        name: info.name?.trim() || '未命名设备',
+        kind: normalizePeerKind(info.kind),
         lastConnectedAt: Date.now(),
       }
+      const others = this.recentPeers.filter((p) => !samePeer(p, entry))
       this.recentPeers = [entry, ...others].slice(0, 5)
       this.persist()
     },
