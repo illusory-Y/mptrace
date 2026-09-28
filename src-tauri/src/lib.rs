@@ -15,6 +15,7 @@ use std::path::PathBuf;
 #[cfg(not(target_os = "android"))]
 use std::process::Command;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State};
 
 #[cfg(target_os = "android")]
@@ -47,11 +48,53 @@ struct WriteSession {
     name: String,
     mime: String,
     tmp: PathBuf,
+    received: u64,
 }
 
 struct AppState {
     sessions: Mutex<HashMap<u64, WriteSession>>,
     next_id: Mutex<u64>,
+}
+
+fn native_log_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let cache = app.path().app_cache_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&cache).map_err(|e| format!("创建原生日志目录失败：{e}"))?;
+    Ok(cache.join("mptrace-native.log"))
+}
+
+pub(crate) fn native_log(app: &AppHandle, message: impl AsRef<str>) {
+    let Ok(path) = native_log_path(app) else {
+        return;
+    };
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let message = message.as_ref().replace('\n', " ");
+    let line = format!("[{timestamp}] {message}\n");
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+#[tauri::command]
+fn read_native_log(app: AppHandle) -> Result<String, String> {
+    let path = native_log_path(&app)?;
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(format!("读取原生日志失败：{err}")),
+    }
+}
+
+#[tauri::command]
+fn clear_native_log(app: AppHandle) -> Result<(), String> {
+    let path = native_log_path(&app)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("清理原生日志失败：{err}")),
+    }
 }
 
 // ---------------- 环境与目录选择 ----------------
@@ -181,6 +224,10 @@ async fn create_write_session(
     name: String,
     mime: String,
 ) -> Result<u64, String> {
+    native_log(
+        &app,
+        format!("write.create.begin name={name} mime={mime} dir={dir}"),
+    );
     let id = {
         let mut g = state.next_id.lock().map_err(poison)?;
         let v = *g;
@@ -190,7 +237,13 @@ async fn create_write_session(
     let cache = app.path().app_cache_dir().map_err(|e| e.to_string())?;
     fs::create_dir_all(&cache).map_err(|e| format!("创建缓存目录失败：{e}"))?;
     let tmp = cache.join(format!(".pts_recv_{id}.part"));
-    File::create(&tmp).map_err(|e| format!("创建临时文件失败：{e}"))?;
+    File::create(&tmp).map_err(|e| {
+        native_log(
+            &app,
+            format!("write.create.failed id={id} stage=temp_file error={e}"),
+        );
+        format!("创建临时文件失败：{e}")
+    })?;
     state.sessions.lock().map_err(poison)?.insert(
         id,
         WriteSession {
@@ -198,45 +251,82 @@ async fn create_write_session(
             name,
             mime,
             tmp,
+            received: 0,
         },
     );
+    native_log(&app, format!("write.create.ok id={id}"));
     Ok(id)
 }
 
 #[tauri::command]
 async fn append_write_session(
+    app: AppHandle,
     state: State<'_, AppState>,
     id: u64,
     b64: String,
 ) -> Result<(), String> {
-    let tmp = {
-        let sessions = state.sessions.lock().map_err(poison)?;
-        let s = sessions
-            .get(&id)
-            .ok_or_else(|| format!("写入会话 {id} 不存在"))?;
-        s.tmp.clone()
-    };
     let bytes = STANDARD
         .decode(b64)
         .map_err(|e| format!("base64 解码失败：{e}"))?;
-    let mut f = OpenOptions::new()
-        .append(true)
-        .open(&tmp)
-        .map_err(|e| format!("写入临时文件失败：{e}"))?;
-    f.write_all(&bytes).map_err(|e| format!("写入失败：{e}"))?;
+    let tmp = {
+        let mut sessions = state.sessions.lock().map_err(poison)?;
+        let s = sessions
+            .get_mut(&id)
+            .ok_or_else(|| format!("写入会话 {id} 不存在"))?;
+        s.received = s.received.saturating_add(bytes.len() as u64);
+        (s.tmp.clone(), s.received)
+    };
+    let mut f = OpenOptions::new().append(true).open(&tmp.0).map_err(|e| {
+        native_log(
+            &app,
+            format!("write.append.failed id={id} stage=open error={e}"),
+        );
+        format!("写入临时文件失败：{e}")
+    })?;
+    f.write_all(&bytes).map_err(|e| {
+        native_log(
+            &app,
+            format!("write.append.failed id={id} stage=write error={e}"),
+        );
+        format!("写入失败：{e}")
+    })?;
+    native_log(
+        &app,
+        format!(
+            "write.append.ok id={id} chunk={} total={}",
+            bytes.len(),
+            tmp.1
+        ),
+    );
     Ok(())
 }
 
 #[tauri::command]
-async fn finish_write_session(state: State<'_, AppState>, id: u64) -> Result<SavedFile, String> {
+async fn finish_write_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: u64,
+) -> Result<SavedFile, String> {
     let session = state
         .sessions
         .lock()
         .map_err(poison)?
         .remove(&id)
         .ok_or_else(|| format!("写入会话 {id} 不存在"))?;
+    let tmp_size = fs::metadata(&session.tmp).map(|m| m.len()).unwrap_or(0);
+    native_log(
+        &app,
+        format!(
+            "write.finish.begin id={id} received={} tmp_size={} tmp={} dir={}",
+            session.received,
+            tmp_size,
+            session.tmp.display(),
+            session.dir
+        ),
+    );
     #[cfg(target_os = "android")]
     let saved = platform_android::save_file_from_path(
+        &app,
         &session.dir,
         &session.name,
         &session.mime,
@@ -246,14 +336,47 @@ async fn finish_write_session(state: State<'_, AppState>, id: u64) -> Result<Sav
     #[cfg(not(target_os = "android"))]
     let saved = move_temp_file(&session.dir, &session.name, &session.tmp);
 
-    let _ = fs::remove_file(&session.tmp);
-    saved
+    match saved {
+        Ok(saved) => {
+            native_log(
+                &app,
+                format!(
+                    "write.finish.ok id={id} uri={} display={}",
+                    saved.uri, saved.display
+                ),
+            );
+            if let Err(err) = fs::remove_file(&session.tmp) {
+                native_log(
+                    &app,
+                    format!("write.finish.cleanup_failed id={id} error={err}"),
+                );
+            }
+            Ok(saved)
+        }
+        Err(err) => {
+            native_log(
+                &app,
+                format!(
+                    "write.finish.failed id={id} error={err} temp_kept={}",
+                    session.tmp.display()
+                ),
+            );
+            Err(err)
+        }
+    }
 }
 
 #[tauri::command]
-async fn cancel_write_session(state: State<'_, AppState>, id: u64) -> Result<(), String> {
+async fn cancel_write_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: u64,
+) -> Result<(), String> {
     if let Some(s) = state.sessions.lock().map_err(poison)?.remove(&id) {
         let _ = fs::remove_file(s.tmp);
+        native_log(&app, format!("write.cancel.ok id={id}"));
+    } else {
+        native_log(&app, format!("write.cancel.missing id={id}"));
     }
     Ok(())
 }
@@ -345,6 +468,8 @@ pub fn run() {
             append_write_session,
             finish_write_session,
             cancel_write_session,
+            read_native_log,
+            clear_native_log,
             open_saved_file
         ])
         .run(tauri::generate_context!())

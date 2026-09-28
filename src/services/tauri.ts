@@ -33,3 +33,13 @@ export async function openSavedFile(uri: string, mime = 'application/octet-strea
   }
   await invoke('open_saved_file', { uri, mime })
 }
+
+export async function readNativeLog(): Promise<string> {
+  if (!isTauri) return ''
+  return invoke<string>('read_native_log')
+}
+
+export async function clearNativeLog(): Promise<void> {
+  if (!isTauri) return
+  await invoke('clear_native_log')
+}

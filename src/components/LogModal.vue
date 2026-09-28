@@ -2,6 +2,7 @@
 // 运行日志查看弹窗：只读展示 + 一键复制 + 清空
 import { computed, ref, watch } from 'vue'
 import { logger } from '../services/logger'
+import { clearNativeLog, readNativeLog } from '../services/tauri'
 
 const props = defineProps<{ open: boolean }>()
 const emit = defineEmits<{ (e: 'close'): void }>()
@@ -9,12 +10,22 @@ const emit = defineEmits<{ (e: 'close'): void }>()
 const text = ref('')
 const copied = ref(false)
 
+async function refresh() {
+  let native = ''
+  try {
+    native = await readNativeLog()
+  } catch (e) {
+    native = `读取 Android 原生日志失败：${(e as Error).message}`
+  }
+  text.value = logger.exportText() + (native ? `\n\n# Android 原生日志\n${native}` : '')
+}
+
 watch(
   () => props.open,
   (v) => {
     if (v) {
-      text.value = logger.exportText()
       copied.value = false
+      void refresh()
     }
   },
 )
@@ -35,7 +46,7 @@ async function copy() {
 
 function clearLogs() {
   logger.clear()
-  text.value = logger.exportText()
+  void clearNativeLog().finally(() => void refresh())
 }
 </script>
 

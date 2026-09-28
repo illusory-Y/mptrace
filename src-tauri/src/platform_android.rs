@@ -12,7 +12,8 @@ use std::io::Read;
 use std::os::fd::RawFd;
 use std::path::Path;
 
-use crate::SavedFile;
+use crate::{native_log, SavedFile};
+use tauri::AppHandle;
 
 const DOWNLOADS_COLLECTION: &str = "content://media/external/downloads";
 const DOWNLOADS_SUBDIR_PREFIX: &str = "android-downloads://";
@@ -67,8 +68,8 @@ fn set_download_relative_path<'a>(
     subdir: Option<&str>,
 ) -> Result<(), String> {
     let relative = match subdir {
-        Some(path) => format!("Download/{path}"),
-        None => "Download".to_string(),
+        Some(path) => format!("Download/{path}/"),
+        None => "Download/".to_string(),
     };
     cv_put(env, values, "relative_path", &relative)
 }
@@ -100,20 +101,40 @@ pub fn save(dir: &str, name: &str, mime: &str, bytes: &[u8]) -> Result<SavedFile
 
 /// 从临时文件流式写入 Android 目标目录，避免在传输完成时一次性读取整个文件。
 pub fn save_file_from_path(
+    app: &AppHandle,
     dir: &str,
     name: &str,
     mime: &str,
     source: &Path,
 ) -> Result<SavedFile, String> {
-    with_env(|env| {
+    native_log(
+        app,
+        format!(
+            "android.save.begin name={name} mime={mime} dir={dir} source={} source_size={}",
+            source.display(),
+            std::fs::metadata(source).map(|m| m.len()).unwrap_or(0)
+        ),
+    );
+    let result = with_env(|env| {
         let activity = current_context(env)?;
         let sdk = sdk_int(env)?;
         let download_subdir = android_download_subdir(dir);
+        native_log(
+            app,
+            format!(
+                "android.save.route sdk={sdk} subdir={:?} saf={}",
+                download_subdir,
+                dir.starts_with("content://")
+                    && dir != DOWNLOADS_COLLECTION
+                    && download_subdir.is_none()
+            ),
+        );
         if dir.starts_with("content://") && dir != DOWNLOADS_COLLECTION && download_subdir.is_none()
         {
             save_via_saf_path(env, &activity, dir, name, mime, source)
         } else if sdk >= 29 {
             save_via_mediastore_path(
+                app,
                 env,
                 &activity,
                 name,
@@ -124,7 +145,18 @@ pub fn save_file_from_path(
         } else {
             save_via_external_legacy_path(env, &activity, name, source)
         }
-    })
+    });
+    match &result {
+        Ok(saved) => native_log(
+            app,
+            format!(
+                "android.save.ok uri={} display={}",
+                saved.uri, saved.display
+            ),
+        ),
+        Err(err) => native_log(app, format!("android.save.failed error={err}")),
+    }
+    result
 }
 /// 对 SAF 目录申请持久化读写授权（应用重启后仍有效）
 pub fn persist_tree_uri(uri_str: &str) -> Result<(), String> {
@@ -205,6 +237,7 @@ fn save_via_mediastore<'a>(
 }
 
 fn save_via_mediastore_path<'a>(
+    app: &AppHandle,
     env: &mut JNIEnv<'a>,
     activity: &JObject<'a>,
     name: &str,
@@ -212,6 +245,7 @@ fn save_via_mediastore_path<'a>(
     source: &Path,
     subdir: Option<&str>,
 ) -> Result<SavedFile, String> {
+    native_log(app, "android.mediastore.begin");
     let resolver = content_resolver(env, activity)?;
     let dl_class = env
         .find_class("android/provider/MediaStore$Downloads")
@@ -242,17 +276,30 @@ fn save_via_mediastore_path<'a>(
         .l()
         .map_err(|e| e.to_string())?;
     catch_exc(env, "MediaStore.insert")?;
+    native_log(
+        app,
+        format!("android.mediastore.insert uri_null={}", uri.is_null()),
+    );
     if uri.is_null() {
         return Err("系统拒绝创建下载文件".to_string());
     }
+    native_log(app, "android.mediastore.write.begin");
     if let Err(err) = write_file_via_output_stream(env, &resolver, &uri, source) {
+        native_log(app, format!("android.mediastore.write.failed error={err}"));
         let _ = delete_uri(env, &resolver, &uri);
         return Err(err);
     }
+    native_log(app, "android.mediastore.write.ok");
+    native_log(app, "android.mediastore.publish.begin");
     if let Err(err) = publish_media_store_file(env, &resolver, &uri) {
+        native_log(
+            app,
+            format!("android.mediastore.publish.failed error={err}"),
+        );
         let _ = delete_uri(env, &resolver, &uri);
         return Err(err);
     }
+    native_log(app, "android.mediastore.publish.ok");
     Ok(SavedFile {
         uri: object_to_string(env, &uri)?,
         display: download_display(subdir, name),

@@ -150,3 +150,13 @@ function mirrorConsole(e: LogEntry) {
 }
 
 export const logger = new AppLogger()
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('error', (event) => {
+    logger.error('window', `未捕获异常：${event.message || '未知错误'} @ ${event.filename || 'unknown'}:${event.lineno || 0}`)
+  })
+  window.addEventListener('unhandledrejection', (event) => {
+    const reason = event.reason instanceof Error ? event.reason.message : String(event.reason)
+    logger.error('window', `未处理 Promise 异常：${reason}`)
+  })
+}

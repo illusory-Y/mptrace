@@ -488,7 +488,9 @@ export class TransferPeer {
     this.finishingRecvId = id
     try {
       if (!writer) throw new Error('接收写入会话不存在')
+      logger.info('recv', `文件分片已接收，开始调用保存完成接口：${job.name}（${job.size} 字节）`)
       const saved = await writer.finish()
+      logger.info('recv', `保存完成接口已返回：${saved.display || saved.uri || job.name}`)
       job.state = 'done'
       job.transferred = job.size
       job.savedTo = saved.display
@@ -497,15 +499,19 @@ export class TransferPeer {
       logger.info('recv', `接收完成：${saved.display || job.name}`)
       this.emitJobs()
       if (this.imageChunks) {
-        // 直接把分片交给 Blob，避免完成瞬间再分配一份完整图片导致 Android OOM。
-        const blob = new Blob(this.imageChunks as unknown as BlobPart[], { type: job.mime })
-        this.cb.onReceivedImage(blob, saved.display)
+        try {
+          // 直接把分片交给 Blob，避免完成瞬间再分配一份完整图片导致 Android OOM。
+          const blob = new Blob(this.imageChunks as unknown as BlobPart[], { type: job.mime })
+          this.cb.onReceivedImage(blob, saved.display)
+        } catch (e) {
+          logger.error('recv-preview', `文件已保存，但图片预览回调失败：${(e as Error).message}`)
+        }
       }
     } catch (e) {
       await writer?.cancel().catch(() => {})
       job.state = 'error'
       job.error = (e as Error).message
-      logger.error('recv', `接收失败：${job.error}`)
+      logger.error('recv', `接收失败（id=${id}）：${job.error}`)
       this.emitJobs()
     } finally {
       if (this.finishingRecvId === id) this.finishingRecvId = null

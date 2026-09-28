@@ -5,6 +5,7 @@
 // ============================================================
 import { invoke } from '@tauri-apps/api/core'
 import { isTauri } from './tauri'
+import { logger } from './logger'
 import type { SavedFile } from '../types'
 
 /** 时间戳 + 原文件名，避免重名覆盖（Rust 侧还会再做一次冲突兜底） */
@@ -99,21 +100,39 @@ const APPEND_CHUNK = 512 * 1024 // IPC base64 分片，单包 512KB
 class TauriReceivedWriter implements ReceivedWriter {
   private sessionId: number | null = null
   async create(dir: string, name: string, mime: string) {
-    this.sessionId = await invoke<number>('create_write_session', { dir, name, mime })
+    logger.info('writer', `创建原生写入会话：${name} mime=${mime} dir=${dir}`)
+    try {
+      this.sessionId = await invoke<number>('create_write_session', { dir, name, mime })
+      logger.info('writer', `原生写入会话已创建：${this.sessionId}`)
+    } catch (e) {
+      logger.error('writer', `创建原生写入会话失败：${(e as Error).message}`)
+      throw e
+    }
   }
   async append(chunk: Uint8Array) {
     const sessionId = this.sessionId
     if (sessionId === null) throw new Error('写入会话尚未创建')
     for (let i = 0; i < chunk.length; i += APPEND_CHUNK) {
       const b64 = bytesToBase64(chunk.subarray(i, i + APPEND_CHUNK))
-      await invoke('append_write_session', { id: sessionId, b64 })
+      try {
+        await invoke('append_write_session', { id: sessionId, b64 })
+      } catch (e) {
+        logger.error('writer', `追加写入失败：session=${sessionId} bytes=${chunk.length} error=${(e as Error).message}`)
+        throw e
+      }
     }
   }
   async finish() {
     const sessionId = this.sessionId
     if (sessionId === null) throw new Error('写入会话尚未创建')
+    logger.info('writer', `调用原生完成写入：session=${sessionId}`)
     try {
-      return await invoke<SavedFile>('finish_write_session', { id: sessionId })
+      const saved = await invoke<SavedFile>('finish_write_session', { id: sessionId })
+      logger.info('writer', `原生完成写入返回：session=${sessionId} uri=${saved.uri}`)
+      return saved
+    } catch (e) {
+      logger.error('writer', `完成原生写入失败：session=${sessionId} error=${(e as Error).message}`)
+      throw e
     } finally {
       this.sessionId = null
     }
@@ -122,6 +141,7 @@ class TauriReceivedWriter implements ReceivedWriter {
     const sessionId = this.sessionId
     this.sessionId = null
     if (sessionId !== null) {
+      logger.warn('writer', `取消原生写入：session=${sessionId}`)
       await invoke('cancel_write_session', { id: sessionId }).catch(() => {})
     }
   }
