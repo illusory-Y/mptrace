@@ -97,21 +97,33 @@ export interface ReceivedWriter {
 const APPEND_CHUNK = 512 * 1024 // IPC base64 分片，单包 512KB
 
 class TauriReceivedWriter implements ReceivedWriter {
-  private sessionId = 0
+  private sessionId: number | null = null
   async create(dir: string, name: string, mime: string) {
     this.sessionId = await invoke<number>('create_write_session', { dir, name, mime })
   }
   async append(chunk: Uint8Array) {
+    const sessionId = this.sessionId
+    if (sessionId === null) throw new Error('写入会话尚未创建')
     for (let i = 0; i < chunk.length; i += APPEND_CHUNK) {
       const b64 = bytesToBase64(chunk.subarray(i, i + APPEND_CHUNK))
-      await invoke('append_write_session', { id: this.sessionId, b64 })
+      await invoke('append_write_session', { id: sessionId, b64 })
     }
   }
   async finish() {
-    return invoke<SavedFile>('finish_write_session', { id: this.sessionId })
+    const sessionId = this.sessionId
+    if (sessionId === null) throw new Error('写入会话尚未创建')
+    try {
+      return await invoke<SavedFile>('finish_write_session', { id: sessionId })
+    } finally {
+      this.sessionId = null
+    }
   }
   async cancel() {
-    if (this.sessionId) await invoke('cancel_write_session', { id: this.sessionId }).catch(() => {})
+    const sessionId = this.sessionId
+    this.sessionId = null
+    if (sessionId !== null) {
+      await invoke('cancel_write_session', { id: sessionId }).catch(() => {})
+    }
   }
 }
 

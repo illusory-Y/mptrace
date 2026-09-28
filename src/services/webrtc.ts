@@ -63,6 +63,8 @@ export class TransferPeer {
   private imageChunks: Uint8Array[] | null = null
   private imageBytes = 0
   private recvQueue: Promise<void> = Promise.resolve()
+  private channelGeneration = 0
+  private finishingRecvId: string | null = null
   private speedTimer: number | null = null
   private lastTickBytes = new Map<string, number>()
   private lastKind: NetPathKind = 'unknown'
@@ -336,9 +338,13 @@ export class TransferPeer {
   }
 
   private bindChannel(ch: RTCDataChannel) {
+    const generation = ++this.channelGeneration
+    const isCurrentChannel = () =>
+      this.channel === ch && this.channelGeneration === generation
     this.channel = ch
     ch.binaryType = 'arraybuffer'
     ch.onopen = () => {
+      if (!isCurrentChannel()) return
       this.closed = false
       logger.info('channel', '数据通道已打开，可双向传输')
       this.cb.onPhase('connected')
@@ -346,8 +352,10 @@ export class TransferPeer {
       this.startNetPathProbe()
     }
     ch.onclose = () => {
+      if (!isCurrentChannel()) return
       logger.warn('channel', '数据通道已关闭')
       this.stopSpeedTimer()
+      void this.cancelReceive()
       // 未完成任务标记为中断
       let changed = false
       this.jobs.forEach((j) => {
@@ -359,6 +367,7 @@ export class TransferPeer {
       if (changed) this.emitJobs()
     }
     ch.onerror = (ev) => {
+      if (!isCurrentChannel()) return
       const detail = (ev as unknown as { error?: { message?: string } }).error
         ?.message
       logger.error('channel', `数据通道异常：${detail || '未知错误'}`)
@@ -367,19 +376,24 @@ export class TransferPeer {
     ch.onmessage = (ev) => {
       // 串行化接收，保证分帧顺序
       this.recvQueue = this.recvQueue
-        .then(() => this.handleFrame(ev.data))
+        .then(() => {
+          if (!isCurrentChannel()) return
+          return this.handleFrame(ev.data)
+        })
         .catch((e) => {
-          const job = this.jobs.find((j) => j.id === this.currentRecvId)
+          if (!isCurrentChannel()) return
+          const recvId = this.currentRecvId
+          const job = this.jobs.find((j) => j.id === recvId)
           const message = e instanceof Error ? e.message : String(e)
           logger.error('recv', `处理接收数据失败：${message}`)
-          if (job && job.state === 'transferring') {
-            job.state = 'error'
-            job.error = message
-            void this.writer?.cancel()
-            this.writer = null
-            this.currentRecvId = null
-            this.imageChunks = null
-            this.imageBytes = 0
+          if (recvId !== null) {
+            if (job && job.state === 'transferring') {
+              job.state = 'error'
+              job.error = message
+            }
+            void this.cancelReceive(recvId)
+          }
+          if (job && job.state === 'error') {
             this.emitJobs()
           }
         })
@@ -402,9 +416,11 @@ export class TransferPeer {
       return
     }
     const bytes = new Uint8Array(data)
-    const job = this.jobs.find((j) => j.id === this.currentRecvId)
-    if (!job || !this.writer) return
-    await this.writer.append(bytes)
+    const recvId = this.currentRecvId
+    const writer = this.writer
+    const job = this.jobs.find((j) => j.id === recvId)
+    if (!job || !writer) return
+    await writer.append(bytes)
     if (this.imageChunks) {
       if (this.imageBytes + bytes.length <= MAX_PREVIEW_IMAGE_BYTES) {
         this.imageChunks.push(bytes)
@@ -419,6 +435,17 @@ export class TransferPeer {
   }
 
   private async onMeta(ctrl: Extract<ChannelControl, { t: 'meta' }>) {
+    if (this.currentRecvId === ctrl.id && this.writer) return
+    if (this.currentRecvId !== null) {
+      const previousId = this.currentRecvId
+      const previousJob = this.jobs.find((j) => j.id === previousId)
+      await this.cancelReceive(previousId)
+      if (previousJob && previousJob.state === 'transferring') {
+        previousJob.state = 'error'
+        previousJob.error = '接收会话被新的文件替换'
+        this.emitJobs()
+      }
+    }
     this.currentRecvId = ctrl.id
     const name = timestampName(ctrl.name)
     logger.info(
@@ -436,9 +463,10 @@ export class TransferPeer {
       speed: 0,
     }
     this.upsertJob(job)
-    this.writer = createReceivedWriter()
+    const writer = createReceivedWriter()
     try {
-      await this.writer.create(this.cb.getSaveDir(), name, job.mime)
+      await writer.create(this.cb.getSaveDir(), name, job.mime)
+      this.writer = writer
     } catch (e) {
       job.state = 'error'
       job.error = (e as Error).message
@@ -455,7 +483,9 @@ export class TransferPeer {
   private async onDone(id: string) {
     const job = this.jobs.find((j) => j.id === id)
     if (!job) return
+    if (id !== this.currentRecvId || job.state !== 'transferring') return
     const writer = this.writer
+    this.finishingRecvId = id
     try {
       if (!writer) throw new Error('接收写入会话不存在')
       const saved = await writer.finish()
@@ -478,24 +508,35 @@ export class TransferPeer {
       logger.error('recv', `接收失败：${job.error}`)
       this.emitJobs()
     } finally {
-      this.writer = null
-      this.imageChunks = null
-      this.imageBytes = 0
-      this.currentRecvId = null
+      if (this.finishingRecvId === id) this.finishingRecvId = null
+      if (this.writer === writer && this.currentRecvId === id) {
+        this.writer = null
+        this.imageChunks = null
+        this.imageBytes = 0
+        this.currentRecvId = null
+      }
     }
   }
 
   private async onRemoteCancel(id: string) {
-    await this.writer?.cancel()
-    this.writer = null
-    this.imageChunks = null
-    this.currentRecvId = null
+    this.abortIds.add(id)
     const job = this.jobs.find((j) => j.id === id)
-    if (job) {
+    if (id === this.currentRecvId) await this.cancelReceive(id)
+    if (job && (job.state === 'transferring' || job.state === 'pending')) {
       job.state = 'canceled'
       this.emitJobs()
     }
-    this.abortIds.add(id)
+  }
+
+  private async cancelReceive(id?: string) {
+    if (id !== undefined && this.currentRecvId !== id) return
+    if (this.finishingRecvId !== null) return
+    const writer = this.writer
+    this.writer = null
+    this.currentRecvId = null
+    this.imageChunks = null
+    this.imageBytes = 0
+    await writer?.cancel().catch(() => {})
   }
 
   // ---------------- 发送侧 ----------------
@@ -583,9 +624,8 @@ export class TransferPeer {
     this.abortIds.add(id)
     const ctrl: ChannelControl = { t: 'cancel', id }
     if (this.channel?.readyState === 'open') this.channel.send(JSON.stringify(ctrl))
-    if (job.direction === 'receiver') {
-      void this.writer?.cancel()
-      this.writer = null
+    if (job.direction === 'receiver' && id === this.currentRecvId) {
+      void this.cancelReceive(id)
     }
     job.state = 'canceled'
     this.emitJobs()
@@ -663,6 +703,9 @@ export class TransferPeer {
   // ---------------- 清理 ----------------
 
   private reset() {
+    this.channelGeneration += 1
+    void this.cancelReceive()
+    this.recvQueue = Promise.resolve()
     this.stopSpeedTimer()
     if (this.netPathTimer !== null) {
       clearInterval(this.netPathTimer)
@@ -677,6 +720,8 @@ export class TransferPeer {
   }
 
   private teardown() {
+    this.channelGeneration += 1
+    void this.cancelReceive()
     this.stopSpeedTimer()
     if (this.netPathTimer !== null) {
       clearInterval(this.netPathTimer)
