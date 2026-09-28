@@ -366,7 +366,23 @@ export class TransferPeer {
     }
     ch.onmessage = (ev) => {
       // 串行化接收，保证分帧顺序
-      this.recvQueue = this.recvQueue.then(() => this.handleFrame(ev.data))
+      this.recvQueue = this.recvQueue
+        .then(() => this.handleFrame(ev.data))
+        .catch((e) => {
+          const job = this.jobs.find((j) => j.id === this.currentRecvId)
+          const message = e instanceof Error ? e.message : String(e)
+          logger.error('recv', `处理接收数据失败：${message}`)
+          if (job && job.state === 'transferring') {
+            job.state = 'error'
+            job.error = message
+            void this.writer?.cancel()
+            this.writer = null
+            this.currentRecvId = null
+            this.imageChunks = null
+            this.imageBytes = 0
+            this.emitJobs()
+          }
+        })
     }
   }
 
@@ -451,14 +467,8 @@ export class TransferPeer {
       logger.info('recv', `接收完成：${saved.display || job.name}`)
       this.emitJobs()
       if (this.imageChunks) {
-        const total = this.imageChunks.reduce((s, c) => s + c.length, 0)
-        const merged = new Uint8Array(total)
-        let off = 0
-        for (const c of this.imageChunks) {
-          merged.set(c, off)
-          off += c.length
-        }
-        const blob = new Blob([merged], { type: job.mime })
+        // 直接把分片交给 Blob，避免完成瞬间再分配一份完整图片导致 Android OOM。
+        const blob = new Blob(this.imageChunks as unknown as BlobPart[], { type: job.mime })
         this.cb.onReceivedImage(blob, saved.display)
       }
     } catch (e) {

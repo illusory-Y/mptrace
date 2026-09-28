@@ -8,8 +8,8 @@ use jni::objects::*;
 use jni::sys::jsize;
 use jni::{JNIEnv, JavaVM};
 use std::fs::File;
-use std::io::{Read, Write};
-use std::os::fd::{FromRawFd, RawFd};
+use std::io::Read;
+use std::os::fd::RawFd;
 use std::path::Path;
 
 use crate::SavedFile;
@@ -17,6 +17,7 @@ use crate::SavedFile;
 const DOWNLOADS_COLLECTION: &str = "content://media/external/downloads";
 const DOWNLOADS_SUBDIR_PREFIX: &str = "android-downloads://";
 const WRITE_CHUNK: usize = 512 * 1024; // 限制单次写入，降低 Android 内存峰值
+const MEDIA_IS_PENDING: &str = "is_pending";
 
 fn android_download_subdir(dir: &str) -> Option<String> {
     let raw = dir.strip_prefix(DOWNLOADS_SUBDIR_PREFIX)?;
@@ -76,7 +77,7 @@ fn set_download_relative_path<'a>(
 
 pub fn save(dir: &str, name: &str, mime: &str, bytes: &[u8]) -> Result<SavedFile, String> {
     with_env(|env| {
-        let activity = current_activity(env)?;
+        let activity = current_context(env)?;
         let sdk = sdk_int(env)?;
         let download_subdir = android_download_subdir(dir);
         if dir.starts_with("content://") && dir != DOWNLOADS_COLLECTION && download_subdir.is_none()
@@ -105,7 +106,7 @@ pub fn save_file_from_path(
     source: &Path,
 ) -> Result<SavedFile, String> {
     with_env(|env| {
-        let activity = current_activity(env)?;
+        let activity = current_context(env)?;
         let sdk = sdk_int(env)?;
         let download_subdir = android_download_subdir(dir);
         if dir.starts_with("content://") && dir != DOWNLOADS_COLLECTION && download_subdir.is_none()
@@ -128,7 +129,7 @@ pub fn save_file_from_path(
 /// 对 SAF 目录申请持久化读写授权（应用重启后仍有效）
 pub fn persist_tree_uri(uri_str: &str) -> Result<(), String> {
     with_env(|env| {
-        let activity = current_activity(env)?;
+        let activity = current_context(env)?;
         let resolver = content_resolver(env, &activity)?;
         let uri = parse_uri(env, uri_str)?;
         // FLAG_GRANT_READ_URI_PERMISSION(1) | FLAG_GRANT_WRITE_URI_PERMISSION(2) = 3
@@ -172,6 +173,7 @@ fn save_via_mediastore<'a>(
     cv_put(env, &values, "display_name", name)?;
     cv_put(env, &values, "mime_type", mime)?;
     set_download_relative_path(env, &values, subdir)?;
+    cv_put_i32(env, &values, MEDIA_IS_PENDING, 1)?;
 
     let uri = env
         .call_method(
@@ -187,7 +189,14 @@ fn save_via_mediastore<'a>(
     if uri.is_null() {
         return Err("系统拒绝创建下载文件".to_string());
     }
-    write_via_output_stream(env, &resolver, &uri, bytes)?;
+    if let Err(err) = write_via_output_stream(env, &resolver, &uri, bytes) {
+        let _ = delete_uri(env, &resolver, &uri);
+        return Err(err);
+    }
+    if let Err(err) = publish_media_store_file(env, &resolver, &uri) {
+        let _ = delete_uri(env, &resolver, &uri);
+        return Err(err);
+    }
     let uri_str = object_to_string(env, &uri)?;
     Ok(SavedFile {
         uri: uri_str,
@@ -221,6 +230,7 @@ fn save_via_mediastore_path<'a>(
     cv_put(env, &values, "display_name", name)?;
     cv_put(env, &values, "mime_type", mime)?;
     set_download_relative_path(env, &values, subdir)?;
+    cv_put_i32(env, &values, MEDIA_IS_PENDING, 1)?;
     let uri = env
         .call_method(
             &resolver,
@@ -235,7 +245,14 @@ fn save_via_mediastore_path<'a>(
     if uri.is_null() {
         return Err("系统拒绝创建下载文件".to_string());
     }
-    write_file_via_output_stream(env, &resolver, &uri, source)?;
+    if let Err(err) = write_file_via_output_stream(env, &resolver, &uri, source) {
+        let _ = delete_uri(env, &resolver, &uri);
+        return Err(err);
+    }
+    if let Err(err) = publish_media_store_file(env, &resolver, &uri) {
+        let _ = delete_uri(env, &resolver, &uri);
+        return Err(err);
+    }
     Ok(SavedFile {
         uri: object_to_string(env, &uri)?,
         display: download_display(subdir, name),
@@ -452,7 +469,9 @@ fn save_via_external_legacy<'a>(
         .new_object(&fos_class, "<init>", &[JValue::Object(&file)])
         .map_err(|e| e.to_string())?;
     catch_exc(env, "FileOutputStream")?;
-    write_bytes_to_stream(env, &stream, bytes)?;
+    let write_result = write_bytes_to_stream(env, &stream, bytes);
+    let close_result = close_output_stream(env, &stream);
+    write_result.and(close_result)?;
     Ok(SavedFile {
         uri: format!("/sdcard/Download/{name}"),
         display: format!("公共下载目录 Download/{name}"),
@@ -461,7 +480,7 @@ fn save_via_external_legacy<'a>(
 
 fn save_via_external_legacy_path<'a>(
     env: &mut JNIEnv<'a>,
-    activity: &JObject<'a>,
+    _activity: &JObject<'a>,
     name: &str,
     source: &Path,
 ) -> Result<SavedFile, String> {
@@ -498,7 +517,9 @@ fn save_via_external_legacy_path<'a>(
         .new_object(&fos_class, "<init>", &[JValue::Object(&file)])
         .map_err(|e| e.to_string())?;
     catch_exc(env, "FileOutputStream")?;
-    write_file_to_stream(env, &stream, source)?;
+    let write_result = write_file_to_stream(env, &stream, source);
+    let close_result = close_output_stream(env, &stream);
+    write_result.and(close_result)?;
     Ok(SavedFile {
         uri: format!("/sdcard/Download/{name}"),
         display: format!("公共下载目录 Download/{name}"),
@@ -545,29 +566,53 @@ fn close_parcel_file_descriptor<'a>(env: &mut JNIEnv<'a>, pfd: &JObject<'a>) -> 
     catch_exc(env, "ParcelFileDescriptor.close")
 }
 
+fn open_output_stream<'a>(
+    env: &mut JNIEnv<'a>,
+    resolver: &JObject<'a>,
+    uri: &JObject<'a>,
+) -> Result<JObject<'a>, String> {
+    let mode: JObject = env.new_string("w").map_err(|e| e.to_string())?.into();
+    let result = env.call_method(
+        resolver,
+        "openOutputStream",
+        "(Landroid/net/Uri;Ljava/lang/String;)Ljava/io/OutputStream;",
+        &[JValue::Object(uri), JValue::Object(&mode)],
+    );
+    let value = match result {
+        Ok(value) => value,
+        Err(err) => {
+            let detail = err.to_string();
+            let _ = catch_exc(env, "openOutputStream");
+            return Err(format!("Android 无法打开目标文件写入流：{detail}"));
+        }
+    };
+    let stream = value.l().map_err(|e| e.to_string())?;
+    catch_exc(env, "openOutputStream")?;
+    if stream.is_null() {
+        return Err("Android 无法打开目标文件写入流".to_string());
+    }
+    Ok(stream)
+}
+
+fn close_output_stream<'a>(env: &mut JNIEnv<'a>, stream: &JObject<'a>) -> Result<(), String> {
+    if let Err(err) = env.call_method(stream, "close", "()V", &[]) {
+        let detail = err.to_string();
+        let _ = catch_exc(env, "OutputStream.close");
+        return Err(format!("关闭 Android 文件写入流失败：{detail}"));
+    }
+    catch_exc(env, "OutputStream.close")
+}
+
 fn write_via_output_stream<'a>(
     env: &mut JNIEnv<'a>,
     resolver: &JObject<'a>,
     uri: &JObject<'a>,
     bytes: &[u8],
 ) -> Result<(), String> {
-    let (pfd, dup_fd) = open_parcel_file_descriptor(env, resolver, uri)?;
-    let result = (|| {
-        let mut output = unsafe { File::from_raw_fd(dup_fd) };
-        for part in bytes.chunks(WRITE_CHUNK) {
-            output
-                .write_all(part)
-                .map_err(|e| format!("写入 Android 文件失败：{e}"))?;
-        }
-        output
-            .flush()
-            .map_err(|e| format!("刷新 Android 文件失败：{e}"))?;
-        // 部分 SAF provider 返回的 fd 不支持 fsync；关闭描述符仍会提交已写入内容。
-        let _ = output.sync_all();
-        Ok(())
-    })();
-    let close_result = close_parcel_file_descriptor(env, &pfd);
-    result.and(close_result)
+    let stream = open_output_stream(env, resolver, uri)?;
+    let write_result = write_bytes_to_stream(env, &stream, bytes);
+    let close_result = close_output_stream(env, &stream);
+    write_result.and(close_result)
 }
 
 fn write_file_via_output_stream<'a>(
@@ -576,21 +621,10 @@ fn write_file_via_output_stream<'a>(
     uri: &JObject<'a>,
     source: &Path,
 ) -> Result<(), String> {
-    let (pfd, dup_fd) = open_parcel_file_descriptor(env, resolver, uri)?;
-    let result = (|| {
-        let mut input = File::open(source).map_err(|e| format!("打开临时文件失败：{e}"))?;
-        let mut output = unsafe { File::from_raw_fd(dup_fd) };
-        std::io::copy(&mut input, &mut output)
-            .map_err(|e| format!("导入 Android 文件失败：{e}"))?;
-        output
-            .flush()
-            .map_err(|e| format!("刷新 Android 文件失败：{e}"))?;
-        // 部分 SAF provider 返回的 fd 不支持 fsync；关闭描述符仍会提交已写入内容。
-        let _ = output.sync_all();
-        Ok(())
-    })();
-    let close_result = close_parcel_file_descriptor(env, &pfd);
-    result.and(close_result)
+    let stream = open_output_stream(env, resolver, uri)?;
+    let write_result = write_file_to_stream(env, &stream, source);
+    let close_result = close_output_stream(env, &stream);
+    write_result.and(close_result)
 }
 
 fn write_file_to_stream<'a>(
@@ -609,9 +643,6 @@ fn write_file_to_stream<'a>(
         }
         write_bytes_to_stream_part(env, stream, &buf[..n])?;
     }
-    env.call_method(stream, "close", "()V", &[])
-        .map_err(|e| e.to_string())?;
-    catch_exc(env, "OutputStream.close")?;
     Ok(())
 }
 
@@ -623,9 +654,6 @@ fn write_bytes_to_stream<'a>(
     for part in bytes.chunks(WRITE_CHUNK) {
         write_bytes_to_stream_part(env, stream, part)?;
     }
-    env.call_method(stream, "close", "()V", &[])
-        .map_err(|e| e.to_string())?;
-    catch_exc(env, "OutputStream.close")?;
     Ok(())
 }
 
@@ -635,14 +663,26 @@ fn write_bytes_to_stream_part<'a>(
     part: &[u8],
 ) -> Result<(), String> {
     let signed: Vec<i8> = part.iter().map(|b| *b as i8).collect();
-    let arr = env
-        .new_byte_array(signed.len() as jsize)
-        .map_err(|e| e.to_string())?;
-    env.set_byte_array_region(&arr, 0, &signed)
-        .map_err(|e| e.to_string())?;
+    let arr = match env.new_byte_array(signed.len() as jsize) {
+        Ok(arr) => arr,
+        Err(err) => {
+            let detail = err.to_string();
+            let _ = catch_exc(env, "NewByteArray");
+            return Err(format!("创建 Android 写入缓冲区失败：{detail}"));
+        }
+    };
+    if let Err(err) = env.set_byte_array_region(&arr, 0, &signed) {
+        let detail = err.to_string();
+        let _ = catch_exc(env, "SetByteArrayRegion");
+        return Err(format!("准备 Android 写入缓冲区失败：{detail}"));
+    }
     let arr_obj: JObject = arr.into();
-    env.call_method(stream, "write", "([B)V", &[JValue::Object(&arr_obj)])
-        .map_err(|e| e.to_string())?;
+    if let Err(err) = env.call_method(stream, "write", "([B)V", &[JValue::Object(&arr_obj)]) {
+        let detail = err.to_string();
+        let _ = catch_exc(env, "OutputStream.write");
+        let _ = env.delete_local_ref(arr_obj);
+        return Err(format!("写入 Android 文件失败：{detail}"));
+    }
     catch_exc(env, "OutputStream.write")?;
     let _ = env.delete_local_ref(arr_obj);
     Ok(())
@@ -664,6 +704,85 @@ fn cv_put<'a>(
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn cv_put_i32<'a>(
+    env: &mut JNIEnv<'a>,
+    values: &JObject<'a>,
+    key: &str,
+    val: i32,
+) -> Result<(), String> {
+    let integer_class = env
+        .find_class("java/lang/Integer")
+        .map_err(|e| e.to_string())?;
+    let boxed = env
+        .new_object(&integer_class, "<init>", &[JValue::Int(val)])
+        .map_err(|e| e.to_string())?;
+    let k: JObject = env.new_string(key).map_err(|e| e.to_string())?.into();
+    env.call_method(
+        values,
+        "put",
+        "(Ljava/lang/String;Ljava/lang/Integer;)V",
+        &[JValue::Object(&k), JValue::Object(&boxed)],
+    )
+    .map_err(|e| e.to_string())?;
+    catch_exc(env, "ContentValues.put(Integer)")
+}
+
+fn publish_media_store_file<'a>(
+    env: &mut JNIEnv<'a>,
+    resolver: &JObject<'a>,
+    uri: &JObject<'a>,
+) -> Result<(), String> {
+    let cv_class = env
+        .find_class("android/content/ContentValues")
+        .map_err(|e| e.to_string())?;
+    let values = env
+        .new_object(&cv_class, "<init>", &[])
+        .map_err(|e| e.to_string())?;
+    cv_put_i32(env, &values, MEDIA_IS_PENDING, 0)?;
+    let selection = JObject::null();
+    let selection_args = JObject::null();
+    env.call_method(
+        resolver,
+        "update",
+        "(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I",
+        &[
+            JValue::Object(uri),
+            JValue::Object(&values),
+            JValue::Object(&selection),
+            JValue::Object(&selection_args),
+        ],
+    )
+    .map_err(|e| e.to_string())?
+    .i()
+    .map_err(|e| e.to_string())?;
+    catch_exc(env, "MediaStore.update")
+}
+
+fn delete_uri<'a>(
+    env: &mut JNIEnv<'a>,
+    resolver: &JObject<'a>,
+    uri: &JObject<'a>,
+) -> Result<(), String> {
+    // 清掉上一个失败的 Java 调用，确保清理动作本身能执行。
+    let _ = env.exception_clear();
+    let selection = JObject::null();
+    let selection_args = JObject::null();
+    env.call_method(
+        resolver,
+        "delete",
+        "(Landroid/net/Uri;Ljava/lang/String;[Ljava/lang/String;)I",
+        &[
+            JValue::Object(uri),
+            JValue::Object(&selection),
+            JValue::Object(&selection_args),
+        ],
+    )
+    .map_err(|e| e.to_string())?
+    .i()
+    .map_err(|e| e.to_string())?;
+    catch_exc(env, "ContentResolver.delete")
 }
 
 fn content_resolver<'a>(
@@ -745,14 +864,17 @@ where
     result
 }
 
-fn current_activity<'a>(_env: &mut JNIEnv<'a>) -> Result<JObject<'a>, String> {
+fn current_context<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>, String> {
     let ctx = ndk_context::android_context();
     // ndk-context 0.1.x 中 vm/context 为公开裸指针字段
     if ctx.context().is_null() {
         return Err("Android Context 不可用".to_string());
     }
     // from_raw 仅包装裸指针，不创建新的 JNI 引用
-    Ok(unsafe { JObject::from_raw(ctx.context().cast()) })
+    // ndk-context 保存的是全局引用；复制成本地引用后再交给 JNI，避免把全局引用
+    // 错误地当作当前线程的局部引用使用。
+    let global = unsafe { JObject::from_raw(ctx.context().cast()) };
+    env.new_local_ref(&global).map_err(|e| e.to_string())
 }
 
 /// 调用系统文件查看器打开刚保存的文件，避免用户只能手动翻找 Download。
@@ -761,7 +883,7 @@ pub fn open_file(uri_str: &str, mime: &str) -> Result<(), String> {
         return Err("该文件没有可供系统打开的 URI，请到 Download 目录查看".to_string());
     }
     with_env(|env| {
-        let activity = current_activity(env)?;
+        let activity = current_context(env)?;
         let intent_class = env
             .find_class("android/content/Intent")
             .map_err(|e| e.to_string())?;
@@ -800,7 +922,8 @@ pub fn open_file(uri_str: &str, mime: &str) -> Result<(), String> {
             &intent,
             "addFlags",
             "(I)Landroid/content/Intent;",
-            &[JValue::Int(1)],
+            // READ_URI_PERMISSION | ACTIVITY_NEW_TASK；兼容 Application Context。
+            &[JValue::Int(0x10000001)],
         )
         .map_err(|e| e.to_string())?;
         env.call_method(
