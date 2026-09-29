@@ -11,6 +11,7 @@ use std::fs::File;
 use std::io::Read;
 use std::os::fd::RawFd;
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{native_log, SavedFile};
 use tauri::AppHandle;
@@ -19,6 +20,61 @@ const DOWNLOADS_COLLECTION: &str = "content://media/external/downloads";
 const DOWNLOADS_SUBDIR_PREFIX: &str = "android-downloads://";
 const WRITE_CHUNK: usize = 512 * 1024; // 限制单次写入，降低 Android 内存峰值
 const MEDIA_IS_PENDING: &str = "is_pending";
+
+#[derive(Clone)]
+struct AndroidBridge {
+    vm: Arc<JavaVM>,
+    application: GlobalRef,
+}
+
+static ANDROID_BRIDGE: OnceLock<Mutex<Option<AndroidBridge>>> = OnceLock::new();
+
+fn android_bridge() -> &'static Mutex<Option<AndroidBridge>> {
+    ANDROID_BRIDGE.get_or_init(|| Mutex::new(None))
+}
+
+/// 由 MainActivity.onCreate 注册 JavaVM 和 Application Context。
+/// Tauri Android 不保证 ndk-context 全局状态已初始化，因此不能依赖它获取 JNI。
+#[no_mangle]
+pub extern "system" fn Java_com_mptrace_app_MainActivity_initNativeContext(
+    mut env: JNIEnv,
+    _this: JObject,
+    activity: JObject,
+) {
+    let result = (|| -> Result<(), String> {
+        let vm = env
+            .get_java_vm()
+            .map_err(|e| format!("获取 Android JVM 失败：{e}"))?;
+        let application = env
+            .call_method(
+                &activity,
+                "getApplicationContext",
+                "()Landroid/content/Context;",
+                &[],
+            )
+            .map_err(|e| format!("获取 Application Context 失败：{e}"))?
+            .l()
+            .map_err(|e| format!("解析 Application Context 失败：{e}"))?;
+        if application.is_null() {
+            return Err("Application Context 为空".to_string());
+        }
+        let application = env
+            .new_global_ref(&application)
+            .map_err(|e| format!("保存 Application Context 失败：{e}"))?;
+        let mut bridge = android_bridge()
+            .lock()
+            .map_err(|_| "Android Context 桥接锁已损坏".to_string())?;
+        *bridge = Some(AndroidBridge {
+            vm: Arc::new(vm),
+            application,
+        });
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        eprintln!("MPTrace Android Context 初始化失败：{error}");
+    }
+}
 
 fn android_download_subdir(dir: &str) -> Option<String> {
     let raw = dir.strip_prefix(DOWNLOADS_SUBDIR_PREFIX)?;
@@ -919,30 +975,16 @@ where
     if let Some(app) = app {
         native_log(app, "android.jni.begin");
     }
-    let ctx = std::panic::catch_unwind(ndk_context::android_context).map_err(|_| {
-        if let Some(app) = app {
-            native_log(app, "android.jni.context.panic");
-        }
-        "Android 原生上下文尚未初始化".to_string()
-    })?;
+    let bridge = android_bridge()
+        .lock()
+        .map_err(|_| "Android Context 桥接锁已损坏".to_string())?
+        .clone()
+        .ok_or_else(|| "Android Context 尚未由 MainActivity 注册".to_string())?;
     if let Some(app) = app {
-        native_log(
-            app,
-            format!(
-                "android.jni.context.ok vm_null={} context_null={}",
-                ctx.vm().is_null(),
-                ctx.context().is_null()
-            ),
-        );
-    }
-    if ctx.vm().is_null() {
-        return Err("Android JavaVM 不可用".to_string());
-    }
-    if let Some(app) = app {
+        native_log(app, "android.jni.bridge.ok");
         native_log(app, "android.jni.vm.begin");
     }
-    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }
-        .map_err(|e| format!("创建 Android JVM 句柄失败：{e}"))?;
+    let vm = bridge.vm.clone();
     if let Some(app) = app {
         native_log(app, "android.jni.vm.ok");
         native_log(app, "android.jni.attach.begin");
@@ -972,25 +1014,14 @@ where
 }
 
 fn current_context<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>, String> {
-    // 保存文件只需要 Application Context。它不依赖当前 Activity 生命周期，
-    // 也避免把 ndk-context 保存的 Activity 全局引用转换成局部引用。
-    let class = env
-        .find_class("android/app/ActivityThread")
-        .map_err(|e| format!("查找 ActivityThread 失败：{e}"))?;
-    let application = env
-        .call_static_method(
-            &class,
-            "currentApplication",
-            "()Landroid/app/Application;",
-            &[],
-        )
-        .map_err(|e| format!("获取 Application Context 失败：{e}"))?
-        .l()
-        .map_err(|e| format!("解析 Application Context 失败：{e}"))?;
-    if application.is_null() {
-        return Err("Android Application Context 为空".to_string());
-    }
-    Ok(application)
+    let application = android_bridge()
+        .lock()
+        .map_err(|_| "Android Context 桥接锁已损坏".to_string())?
+        .as_ref()
+        .map(|bridge| bridge.application.clone())
+        .ok_or_else(|| "Android Application Context 尚未注册".to_string())?;
+    env.new_local_ref(application.as_obj())
+        .map_err(|e| format!("复制 Application Context 失败：{e}"))
 }
 
 /// 调用系统文件查看器打开刚保存的文件，避免用户只能手动翻找 Download。

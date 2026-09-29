@@ -1,6 +1,6 @@
 [package]
 name = "local-transfer-suite"
-version = "1.0.7"
+version = "1.0.8"
 description = "本地 OCR + 点对点文件互传（个人/小范围私下使用）"
 authors = ["you"]
 edition = "2021"
@@ -24,7 +24,6 @@ dirs = "5"
 
 # 仅 Android 编译：SAF / MediaStore 的 JNI 桥接
 [target.'cfg(target_os = "android")'.dependencies]
-ndk-context = "0.1.1"
 jni = "0.21"
 libc = "0.2"
 
