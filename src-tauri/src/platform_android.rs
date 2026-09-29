@@ -115,9 +115,12 @@ pub fn save_file_from_path(
             std::fs::metadata(source).map(|m| m.len()).unwrap_or(0)
         ),
     );
-    let result = with_env(|env| {
+    let result = with_env_logged(app, |env| {
+        native_log(app, "android.save.context.begin");
         let activity = current_context(env)?;
+        native_log(app, "android.save.context.ok");
         let sdk = sdk_int(env)?;
+        native_log(app, format!("android.save.sdk.ok sdk={sdk}"));
         let download_subdir = android_download_subdir(dir);
         native_log(
             app,
@@ -899,29 +902,95 @@ fn with_env<F, T>(f: F) -> Result<T, String>
 where
     F: FnOnce(&mut JNIEnv) -> Result<T, String>,
 {
-    let ctx = ndk_context::android_context();
-    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
+    with_env_inner(None, f)
+}
+
+fn with_env_logged<F, T>(app: &AppHandle, f: F) -> Result<T, String>
+where
+    F: FnOnce(&mut JNIEnv) -> Result<T, String>,
+{
+    with_env_inner(Some(app), f)
+}
+
+fn with_env_inner<F, T>(app: Option<&AppHandle>, f: F) -> Result<T, String>
+where
+    F: FnOnce(&mut JNIEnv) -> Result<T, String>,
+{
+    if let Some(app) = app {
+        native_log(app, "android.jni.begin");
+    }
+    let ctx = std::panic::catch_unwind(ndk_context::android_context).map_err(|_| {
+        if let Some(app) = app {
+            native_log(app, "android.jni.context.panic");
+        }
+        "Android 原生上下文尚未初始化".to_string()
+    })?;
+    if let Some(app) = app {
+        native_log(
+            app,
+            format!(
+                "android.jni.context.ok vm_null={} context_null={}",
+                ctx.vm().is_null(),
+                ctx.context().is_null()
+            ),
+        );
+    }
+    if ctx.vm().is_null() {
+        return Err("Android JavaVM 不可用".to_string());
+    }
+    if let Some(app) = app {
+        native_log(app, "android.jni.vm.begin");
+    }
+    let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }
+        .map_err(|e| format!("创建 Android JVM 句柄失败：{e}"))?;
+    if let Some(app) = app {
+        native_log(app, "android.jni.vm.ok");
+        native_log(app, "android.jni.attach.begin");
+    }
     let mut guard = vm
         .attach_current_thread()
         .map_err(|e| format!("挂载 JVM 线程失败：{e}"))?;
+    if let Some(app) = app {
+        native_log(app, "android.jni.attach.ok");
+        native_log(app, "android.jni.callback.begin");
+    }
     let result = f(&mut guard);
+    if let Some(app) = app {
+        native_log(
+            app,
+            format!("android.jni.callback.end ok={}", result.is_ok()),
+        );
+        native_log(app, "android.jni.exception_clear.begin");
+    }
     // 线程卸载（detach）前清掉任何残留异常；否则部分系统（含鸿蒙）检测到
     // 未处理的 JNI 异常会直接中止进程（表现为接收完成瞬间闪退）。
     let _ = guard.exception_clear();
+    if let Some(app) = app {
+        native_log(app, "android.jni.exception_clear.ok");
+    }
     result
 }
 
 fn current_context<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>, String> {
-    let ctx = ndk_context::android_context();
-    // ndk-context 0.1.x 中 vm/context 为公开裸指针字段
-    if ctx.context().is_null() {
-        return Err("Android Context 不可用".to_string());
+    // 保存文件只需要 Application Context。它不依赖当前 Activity 生命周期，
+    // 也避免把 ndk-context 保存的 Activity 全局引用转换成局部引用。
+    let class = env
+        .find_class("android/app/ActivityThread")
+        .map_err(|e| format!("查找 ActivityThread 失败：{e}"))?;
+    let application = env
+        .call_static_method(
+            &class,
+            "currentApplication",
+            "()Landroid/app/Application;",
+            &[],
+        )
+        .map_err(|e| format!("获取 Application Context 失败：{e}"))?
+        .l()
+        .map_err(|e| format!("解析 Application Context 失败：{e}"))?;
+    if application.is_null() {
+        return Err("Android Application Context 为空".to_string());
     }
-    // from_raw 仅包装裸指针，不创建新的 JNI 引用
-    // ndk-context 保存的是全局引用；复制成本地引用后再交给 JNI，避免把全局引用
-    // 错误地当作当前线程的局部引用使用。
-    let global = unsafe { JObject::from_raw(ctx.context().cast()) };
-    env.new_local_ref(&global).map_err(|e| e.to_string())
+    Ok(application)
 }
 
 /// 调用系统文件查看器打开刚保存的文件，避免用户只能手动翻找 Download。

@@ -1,6 +1,6 @@
 [package]
 name = "local-transfer-suite"
-version = "1.0.6"
+version = "1.0.7"
 description = "本地 OCR + 点对点文件互传（个人/小范围私下使用）"
 authors = ["you"]
 edition = "2021"
@@ -29,7 +29,7 @@ jni = "0.21"
 libc = "0.2"
 
 [profile.release]
-panic = "abort"
+panic = "unwind"
 codegen-units = 1
 lto = true
 opt-level = "s"
