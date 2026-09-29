@@ -259,7 +259,7 @@ fn save_via_mediastore<'a>(
         .find_class("android/content/ContentValues")
         .map_err(|e| e.to_string())?;
     let values = env
-        .new_object(&cv_class, "<init>", &[])
+        .new_object(&cv_class, "()V", &[])
         .map_err(|e| e.to_string())?;
     cv_put(env, &values, "display_name", name)?;
     cv_put(env, &values, "mime_type", mime)?;
@@ -318,7 +318,7 @@ fn save_via_mediastore_path<'a>(
         .find_class("android/content/ContentValues")
         .map_err(|e| e.to_string())?;
     let values = env
-        .new_object(&cv_class, "<init>", &[])
+        .new_object(&cv_class, "()V", &[])
         .map_err(|e| e.to_string())?;
     cv_put(env, &values, "display_name", name)?;
     cv_put(env, &values, "mime_type", mime)?;
@@ -563,7 +563,7 @@ fn save_via_external_legacy<'a>(
     let file = env
         .new_object(
             &file_class,
-            "<init>",
+            "(Ljava/io/File;Ljava/lang/String;)V",
             &[JValue::Object(&dir), JValue::Object(&name_obj)],
         )
         .map_err(|e| e.to_string())?;
@@ -572,7 +572,7 @@ fn save_via_external_legacy<'a>(
         .find_class("java/io/FileOutputStream")
         .map_err(|e| e.to_string())?;
     let stream = env
-        .new_object(&fos_class, "<init>", &[JValue::Object(&file)])
+        .new_object(&fos_class, "(Ljava/io/File;)V", &[JValue::Object(&file)])
         .map_err(|e| e.to_string())?;
     catch_exc(env, "FileOutputStream")?;
     let write_result = write_bytes_to_stream(env, &stream, bytes);
@@ -612,7 +612,7 @@ fn save_via_external_legacy_path<'a>(
     let file = env
         .new_object(
             &file_class,
-            "<init>",
+            "(Ljava/io/File;Ljava/lang/String;)V",
             &[JValue::Object(&dir), JValue::Object(&name_obj)],
         )
         .map_err(|e| e.to_string())?;
@@ -620,7 +620,7 @@ fn save_via_external_legacy_path<'a>(
         .find_class("java/io/FileOutputStream")
         .map_err(|e| e.to_string())?;
     let stream = env
-        .new_object(&fos_class, "<init>", &[JValue::Object(&file)])
+        .new_object(&fos_class, "(Ljava/io/File;)V", &[JValue::Object(&file)])
         .map_err(|e| e.to_string())?;
     catch_exc(env, "FileOutputStream")?;
     let write_result = write_file_to_stream(env, &stream, source);
@@ -822,7 +822,7 @@ fn cv_put_i32<'a>(
         .find_class("java/lang/Integer")
         .map_err(|e| e.to_string())?;
     let boxed = env
-        .new_object(&integer_class, "<init>", &[JValue::Int(val)])
+        .new_object(&integer_class, "(I)V", &[JValue::Int(val)])
         .map_err(|e| e.to_string())?;
     let k: JObject = env.new_string(key).map_err(|e| e.to_string())?.into();
     env.call_method(
@@ -844,7 +844,7 @@ fn publish_media_store_file<'a>(
         .find_class("android/content/ContentValues")
         .map_err(|e| e.to_string())?;
     let values = env
-        .new_object(&cv_class, "<init>", &[])
+        .new_object(&cv_class, "()V", &[])
         .map_err(|e| e.to_string())?;
     cv_put_i32(env, &values, MEDIA_IS_PENDING, 0)?;
     let selection = JObject::null();
@@ -1035,7 +1035,7 @@ pub fn open_file(uri_str: &str, mime: &str) -> Result<(), String> {
             .find_class("android/content/Intent")
             .map_err(|e| e.to_string())?;
         let intent = env
-            .new_object(&intent_class, "<init>", &[])
+            .new_object(&intent_class, "()V", &[])
             .map_err(|e| e.to_string())?;
         let action: JObject = env
             .new_string("android.intent.action.VIEW")
